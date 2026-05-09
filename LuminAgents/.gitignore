@@ -1,9 +1,39 @@
+# Secrets
 .env
+
+# Databases
+db/luminagents.db
+db/*.db-shm
+db/*.db-wal
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Virtual environment
 venv/
+
+# Python cache
 __pycache__/
 *.pyc
 *.pyo
-db/luminagents.db
+*.pyd
+
+# Backup & internal fix scripts
+*.bak
+*.bak_*
+fix_db.py
+fix_orchestrator_duplicates.py
+
+# Internal docs (not for judges)
+DEMO_REHEARSAL.md
+LuminAgents_Progress.md
+
+# Logs & OS
 logs/
 *.log
 .DS_Store
+Thumbs.db
+
+# Claude Code internal settings
+.claude/

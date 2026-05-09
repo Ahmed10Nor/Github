@@ -8,10 +8,8 @@ import gc
 import re
 import os
 
-import os as _os
-_BASE = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
-STACK_FOLDERS = [_os.path.join(_BASE, "academia.stackexchange.com"), _os.path.join(_BASE, "lifehacks.stackexchange.com")]
-DB_PATH = _os.path.join(_BASE, "db", "LuminAgents_Vectors")
+STACK_FOLDERS = [r"D:\Apps\LuminAgents\academia.stackexchange.com", r"D:\Apps\LuminAgents\lifehacks.stackexchange.com"]
+DB_PATH = r"D:\Apps\LuminAgents\db\LuminAgents_Vectors"
 MODEL_NAME = 'all-MiniLM-L6-v2'
 
 device = "cuda" if torch.cuda.is_available() else "cpu"

@@ -7,10 +7,8 @@ from tqdm import tqdm
 import re
 import gc
 
-import os as _os
-_BASE = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
-ZIM_PATH = _os.path.join(_BASE, "wikiquote_ur_all_maxi_2026-04.zim")
-DB_PATH = _os.path.join(_BASE, "db", "LuminAgents_Vectors")
+ZIM_PATH = r"D:\Apps\LuminAgents\wikiquote_ur_all_maxi_2026-04.zim"
+DB_PATH = r"D:\Apps\LuminAgents\db\LuminAgents_Vectors" 
 MODEL_NAME = 'all-MiniLM-L6-v2' 
 
 device = "cuda" if torch.cuda.is_available() else "cpu"

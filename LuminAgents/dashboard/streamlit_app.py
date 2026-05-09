@@ -14,45 +14,134 @@ st.set_page_config(page_title="LuminAgents Dashboard", layout="wide", page_icon=
 # ── Custom CSS ────────────────────────────────────────────────
 st.markdown("""
 <style>
-.agent-row { padding: 6px 10px; border-radius: 6px; margin: 3px 0; font-family: monospace; font-size: 13px; }
-.agent-orchestrator { background: #1e1b4b; color: #a5b4fc; }
-.agent-coach        { background: #052e16; color: #86efac; }
-.agent-planner      { background: #0c1a2e; color: #93c5fd; }
-.agent-researcher   { background: #2d1b4e; color: #d8b4fe; }
-.agent-fixer        { background: #2d0a0a; color: #fca5a5; }
-.agent-onboarding   { background: #1a1a00; color: #fde047; }
-.ts { color: #6b7280; font-size: 11px; margin-right: 8px; }
-.route-badge { display: inline-block; padding: 1px 6px; border-radius: 10px; font-size: 11px; font-weight: bold; margin-right: 6px; }
+/* ── Agent log rows ── */
+.agent-row {
+    padding: 7px 12px; border-radius: 8px; margin: 4px 0;
+    font-family: 'JetBrains Mono', 'Fira Code', monospace; font-size: 12.5px;
+    border-left: 3px solid transparent; transition: opacity 0.2s;
+}
+.agent-orchestrator { background: #1e1b4b; color: #a5b4fc; border-left-color: #6366f1; }
+.agent-coach        { background: #052e16; color: #86efac; border-left-color: #22c55e; }
+.agent-planner      { background: #0c1a2e; color: #93c5fd; border-left-color: #3b82f6; }
+.agent-researcher   { background: #2d1b4e; color: #d8b4fe; border-left-color: #a855f7; }
+.agent-fixer        { background: #2d0a0a; color: #fca5a5; border-left-color: #ef4444; }
+.agent-onboarding   { background: #1a1a00; color: #fde047; border-left-color: #eab308; }
+
+/* ── Timestamps & metadata ── */
+.ts   { color: #4b5563; font-size: 10.5px; margin-right: 10px; letter-spacing: 0.3px; }
+.meta { color: #6b7280; font-size: 10.5px; }
+
+/* ── Route badges ── */
+.route-badge {
+    display: inline-block; padding: 2px 7px; border-radius: 12px;
+    font-size: 10.5px; font-weight: 700; margin-right: 6px; letter-spacing: 0.2px;
+}
 .rb-daily_check      { background: #3b0764; color: #e9d5ff; }
 .rb-content_question { background: #172554; color: #bfdbfe; }
 .rb-plan_change      { background: #052e16; color: #bbf7d0; }
 .rb-out_of_scope     { background: #450a0a; color: #fecaca; }
 .rb-onboarding       { background: #422006; color: #fde68a; }
 .rb-gap              { background: #431407; color: #fed7aa; }
+.rb-goal_reset       { background: #1a0030; color: #d8b4fe; }
+.rb-greeting_checkin { background: #0a2010; color: #86efac; }
+
+/* ── Status pill ── */
+.status-pill {
+    display: inline-flex; align-items: center; gap: 5px;
+    padding: 3px 10px; border-radius: 20px; font-size: 11.5px; font-weight: 600;
+}
+.pill-ok  { background: #052e16; color: #4ade80; border: 1px solid #166534; }
+.pill-off { background: #1c1c1c; color: #6b7280; border: 1px solid #374151; }
+.pill-err { background: #2d0a0a; color: #f87171; border: 1px solid #7f1d1d; }
+
+/* ── Metric card ── */
+.kpi-card {
+    background: #111827; border: 1px solid #1f2937; border-radius: 10px;
+    padding: 14px 18px; text-align: center;
+}
+.kpi-val  { font-size: 28px; font-weight: 700; color: #f3f4f6; line-height: 1.1; }
+.kpi-lbl  { font-size: 11px; color: #6b7280; margin-top: 4px; letter-spacing: 0.5px; text-transform: uppercase; }
+
+/* ── Milestone bar ── */
+.ms-row { display: flex; align-items: center; gap: 10px; padding: 6px 0; }
+.ms-bar-bg  { flex: 1; background: #1f2937; border-radius: 4px; height: 6px; }
+.ms-bar-fill { height: 6px; border-radius: 4px; background: #22c55e; }
+.ms-bar-fill.pending { background: #374151; }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🧠 LuminAgents — Live Dashboard")
 st.markdown(
-    '<div style="display:inline-flex;align-items:center;gap:8px;'
-    'background:#052e16;border:1px solid #166534;border-radius:8px;'
-    'padding:5px 14px;margin-bottom:8px;font-size:13px;color:#86efac;">'
-    '🔐 <b>Security Audit Active</b> — جميع استدعاءات LLM مُسجَّلة ومُشفَّرة في <code>security_audit</code>'
-    '</div>',
+    '<div style="display:flex;align-items:baseline;gap:12px;margin-bottom:2px;">'
+    '<span style="font-size:28px;font-weight:800;color:#f1f5f9;letter-spacing:-0.5px;">🧠 LuminAgents</span>'
+    '<span style="font-size:13px;color:#64748b;font-style:italic;">Multi-Agent Skill Coaching System</span>'
+    '<span style="margin-left:auto;background:#1e3a8a;color:#93c5fd;font-size:11px;'
+    'font-weight:700;padding:3px 10px;border-radius:12px;border:1px solid #1d4ed8;">v7.5</span>'
+    '</div>'
+    '<div style="height:1px;background:linear-gradient(90deg,#3b82f6,#8b5cf6,transparent);margin-bottom:10px;"></div>',
     unsafe_allow_html=True,
 )
 
+# ── System health bar ─────────────────────────────────────────
+_db_ok, _orc_ok = False, False
+try:
+    _hc = get_connection(); _hc.execute("SELECT 1"); _hc.close(); _db_ok = True
+except Exception:
+    pass
+
 orc = LuminAgentsOrchestrator()
+_orc_ok = orc is not None
+
+def _pill(label, ok, err=False):
+    cls = "pill-err" if err else ("pill-ok" if ok else "pill-off")
+    dot = "🔴" if err else ("🟢" if ok else "⚫")
+    return f'<span class="status-pill {cls}">{dot} {label}</span>'
+
+st.markdown(
+    '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px;">'
+    + _pill("Database", _db_ok)
+    + _pill("Orchestrator", _orc_ok)
+    + _pill("Security Audit", True)
+    + _pill("Web-First (Tavily)", True)
+    + '</div>',
+    unsafe_allow_html=True,
+)
 
 # ── Sidebar ────────────────────────────────────────────────────
-st.sidebar.title("🎮 Demo Controls")
-demo_user_id = st.sidebar.text_input("User ID", value="demo_001")
+st.sidebar.markdown(
+    '<div style="text-align:center;padding:8px 0 4px;">'
+    '<span style="font-size:20px;font-weight:800;color:#f1f5f9;">🎮 Demo Controls</span>'
+    '</div>',
+    unsafe_allow_html=True,
+)
+st.sidebar.divider()
+
+# ── User selector (dropdown — no free text to avoid exposing real IDs)
+_known_users: list[str] = []
+try:
+    _uc = get_connection()
+    _rows = _uc.execute("SELECT DISTINCT user_id FROM users ORDER BY user_id").fetchall()
+    _uc.close()
+    _known_users = [r["user_id"] for r in _rows if r["user_id"]]
+except Exception:
+    pass
+if not _known_users:
+    _known_users = ["demo_001"]
+
+demo_user_id = st.sidebar.selectbox(
+    "👤 Active User",
+    _known_users,
+    index=0,
+    help="المستخدم المعروض في جميع التبويبات",
+)
+
+st.sidebar.caption(f"`{demo_user_id}`")
+st.sidebar.divider()
 
 col_a, col_b = st.sidebar.columns(2)
 with col_a:
     auto_refresh = st.checkbox("🔄 Auto", value=True)
 with col_b:
-    refresh_sec = st.selectbox("ثانية", [2, 3, 5], index=0, label_visibility="collapsed")
+    refresh_sec = st.selectbox("⏱", [2, 3, 5], index=0, label_visibility="collapsed")
 
 st.sidebar.divider()
 
@@ -85,15 +174,20 @@ try:
     _ac = get_connection()
     _ar = _ac.execute(
         "SELECT COUNT(*) as n, SUM(tokens_in+tokens_out) as t, "
-        "SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) as e "
+        "SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) as e, "
+        "AVG(duration_ms) as avg_ms "
         "FROM security_audit"
     ).fetchone()
     _ac.close()
     if _ar and _ar["n"]:
-        st.sidebar.metric("LLM Calls Audited", _ar["n"])
-        st.sidebar.metric("Total Tokens",       _ar["t"] or 0)
+        _c1, _c2 = st.sidebar.columns(2)
+        _c1.metric("Calls", _ar["n"])
+        _c2.metric("Tokens", f'{(_ar["t"] or 0):,}')
         _err = _ar["e"] or 0
-        st.sidebar.metric("Errors", _err, delta=f"{'⚠️' if _err else '✅'}")
+        _avg = int(_ar["avg_ms"] or 0)
+        _c3, _c4 = st.sidebar.columns(2)
+        _c3.metric("Errors", f'{"⚠️ " if _err else "✅ "}{_err}')
+        _c4.metric("Avg ms", _avg)
     else:
         st.sidebar.info("No audit records yet")
 except Exception:
@@ -125,42 +219,88 @@ with tab_live:
 
     total_tokens = sum(r["tokens_est"] for r in logs) if logs else 0
     total_llm    = sum(1 for r in logs if r["tokens_est"] > 0) if logs else 0
+    agents_active = len(set(r["agent"] for r in logs)) if logs else 0
+    avg_dur = (
+        int(sum(r["duration_ms"] for r in logs if r["duration_ms"]) /
+            max(1, sum(1 for r in logs if r["duration_ms"])))
+        if logs else 0
+    )
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("📨 Events", len(logs))
-    m2.metric("🔤 Tokens Est.", total_tokens)
-    m3.metric("🤖 LLM Calls", total_llm)
-    m4.metric("⚙️ Agents", len(set(r["agent"] for r in logs)) if logs else 0)
+    m1, m2, m3, m4, m5 = st.columns(5)
+    for col, val, lbl in [
+        (m1, len(logs),      "Events"),
+        (m2, total_tokens,   "Tokens Est."),
+        (m3, total_llm,      "LLM Calls"),
+        (m4, agents_active,  "Agents Active"),
+        (m5, f"{avg_dur}ms", "Avg Latency"),
+    ]:
+        col.markdown(
+            f'<div class="kpi-card"><div class="kpi-val">{val}</div>'
+            f'<div class="kpi-lbl">{lbl}</div></div>',
+            unsafe_allow_html=True,
+        )
 
     st.divider()
 
     if not logs:
-        st.info("لا يوجد نشاط بعد — ابعث رسالة للبوت أو استخدم Test Router")
+        st.markdown(
+            '<div style="text-align:center;padding:40px;color:#374151;">'
+            '<div style="font-size:40px;margin-bottom:8px;">💤</div>'
+            '<div style="font-size:15px;font-weight:600;color:#6b7280;">لا يوجد نشاط بعد</div>'
+            '<div style="font-size:12px;color:#4b5563;margin-top:4px;">'
+            'ابعث رسالة للبوت أو استخدم تبويب <b>Test Router</b></div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
     else:
         ICONS = {
             "orchestrator": "⚙️", "coach": "🎓", "planner": "📋",
             "researcher": "🔍", "fixer": "🔧", "onboarding": "🆕",
         }
+
+        # Filter bar
+        _all_agents = sorted(set(r["agent"] for r in logs))
+        _filter_col1, _filter_col2 = st.columns([2, 3])
+        with _filter_col1:
+            _agent_filter = st.multiselect(
+                "Filter by agent", _all_agents, default=_all_agents,
+                label_visibility="collapsed", placeholder="Filter by agent…"
+            )
+        with _filter_col2:
+            _route_filter = st.multiselect(
+                "Filter by route",
+                sorted(set(r["route"] for r in logs if r["route"])),
+                label_visibility="collapsed", placeholder="Filter by route…"
+            )
+
         for row in logs:
             agent  = row["agent"]
+            if _agent_filter and agent not in _agent_filter:
+                continue
+            route  = row["route"] or ""
+            if _route_filter and route not in _route_filter:
+                continue
+
             action = row["action"]
             detail = row["detail"] or ""
-            route  = row["route"] or ""
             tokens = row["tokens_est"]
             dur    = row["duration_ms"]
             ts     = (row["ts"] or "")[-8:]
             icon   = ICONS.get(agent, "•")
 
             route_html  = f'<span class="route-badge rb-{route}">{route}</span>' if route else ""
-            token_html  = f' <span style="color:#6b7280;font-size:11px;">~{tokens}t</span>' if tokens > 0 else ""
-            dur_html    = f' <span style="color:#6b7280;font-size:11px;">{dur}ms</span>' if dur > 0 else ""
-            detail_html = f'  <span style="opacity:0.8">{detail}</span>' if detail else ""
+            token_html  = f'<span class="meta"> ·~{tokens}t</span>' if tokens > 0 else ""
+            dur_html    = f'<span class="meta"> ·{dur}ms</span>' if dur > 0 else ""
+            detail_html = (
+                f'<span style="opacity:0.72;font-size:11.5px;"> — {detail[:120]}{"…" if len(detail)>120 else ""}</span>'
+                if detail else ""
+            )
 
             st.markdown(
                 f'<div class="agent-row agent-{agent}">'
                 f'<span class="ts">{ts}</span>'
                 f'{route_html}'
-                f'<b>{icon} {agent}</b> → <i>{action}</i>'
+                f'<b>{icon} {agent}</b> → <code style="font-size:11px;opacity:0.9">{action}</code>'
                 f'{detail_html}{token_html}{dur_html}'
                 f'</div>',
                 unsafe_allow_html=True,
@@ -197,14 +337,11 @@ with tab_consensus:
             "لا يوجد جدال بعد — أرسل رسالة تطلب تغيير الخطة، أو ارفع streak إلى 2 من الـ Sidebar."
         )
     else:
-        # Group every 3 debate rows (triggered → coach+fixer perspectives → decision)
-        # We display them grouped: newest debate first
         entries = list(debate_rows)
-        # Separate by type for display
         debates: list[dict] = []
         buffer: dict = {}
 
-        for row in reversed(entries):  # oldest-first for grouping
+        for row in reversed(entries):
             action = row["action"]
             ts     = (row["ts"] or "")[-8:]
             route  = row["route"] or ""
@@ -212,7 +349,6 @@ with tab_consensus:
             agent  = row["agent"]
 
             if action == "consensus_triggered":
-                # Start a new debate group
                 if buffer:
                     debates.append(buffer)
                 buffer = {"ts": ts, "route": route, "trigger": detail,
@@ -235,10 +371,9 @@ with tab_consensus:
                 debates.append(buffer)
                 buffer = {}
 
-        if buffer:  # flush any incomplete group
+        if buffer:
             debates.append(buffer)
 
-        # Display newest first
         for i, debate in enumerate(reversed(debates)):
             route_label = debate.get("route", "")
             ts_label    = debate.get("ts", "")
@@ -304,7 +439,7 @@ with tab_profile:
         conn.close()
         if user:
             st.json({
-                "name":            user["name"],
+                "user_id":         demo_user_id,
                 "goal":            user["goal"],
                 "level":           user["level"],
                 "estimated_weeks": user["estimated_weeks"],
@@ -339,10 +474,45 @@ with tab_profile:
     ).fetchall()
     conn.close()
     if milestones:
+        total_ms  = len(milestones)
+        done_ms   = sum(1 for m in milestones if m["completed"])
+        pct       = int(done_ms / total_ms * 100)
+        st.markdown(
+            f'<div style="background:#111827;border:1px solid #1f2937;border-radius:10px;padding:14px 18px;margin-bottom:10px;">'
+            f'<div style="display:flex;justify-content:space-between;margin-bottom:8px;">'
+            f'<span style="color:#94a3b8;font-size:12px;font-weight:600;">OVERALL PROGRESS</span>'
+            f'<span style="color:#f1f5f9;font-weight:700;">{done_ms}/{total_ms} milestones</span></div>'
+            f'<div style="background:#1f2937;border-radius:6px;height:8px;">'
+            f'<div style="background:linear-gradient(90deg,#22c55e,#16a34a);width:{pct}%;height:8px;border-radius:6px;"></div>'
+            f'</div><div style="text-align:right;color:#4ade80;font-size:12px;margin-top:4px;">{pct}%</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
         for m in milestones:
-            st.write(f"{'✅' if m['completed'] else '⏳'} **{m['title']}** — Week {m['week_start']}→{m['week_end']}")
+            done   = bool(m["completed"])
+            icon   = "✅" if done else "⏳"
+            color  = "#22c55e" if done else "#374151"
+            label  = m["title"]
+            weeks  = f"Wk {m['week_start']}–{m['week_end']}"
+            st.markdown(
+                f'<div style="display:flex;align-items:center;gap:10px;padding:6px 0;'
+                f'border-bottom:1px solid #1f2937;">'
+                f'<span style="font-size:16px;">{icon}</span>'
+                f'<span style="flex:1;color:#e2e8f0;font-size:13px;font-weight:500;">{label}</span>'
+                f'<span style="background:#1f2937;color:#64748b;font-size:10.5px;'
+                f'padding:2px 8px;border-radius:10px;">{weeks}</span>'
+                f'<div style="width:60px;background:#1f2937;border-radius:4px;height:5px;">'
+                f'<div style="background:{color};width:{"100" if done else "0"}%;height:5px;border-radius:4px;"></div>'
+                f'</div></div>',
+                unsafe_allow_html=True,
+            )
     else:
-        st.info("لا توجد milestones بعد")
+        st.markdown(
+            '<div style="text-align:center;padding:20px;color:#4b5563;">'
+            '<div style="font-size:32px;">🗺️</div>'
+            '<div style="font-size:13px;margin-top:4px;">لا توجد milestones — أكمل الـ onboarding أولاً</div>'
+            '</div>', unsafe_allow_html=True,
+        )
 
     st.subheader("🧠 Planner Snapshots")
     conn = get_connection()
@@ -353,25 +523,61 @@ with tab_profile:
     conn.close()
     if snaps:
         for s in snaps:
-            with st.expander(f"Milestone {s['milestone_index']} — {s['created_at']}"):
-                st.code(s["snapshot"])
+            with st.expander(f"📸 Snapshot — Milestone {s['milestone_index']}  |  {s['created_at']}"):
+                st.code(s["snapshot"], language=None)
     else:
         st.info("لا توجد snapshots بعد")
 
 # ════════════════════════════════════════════════════
-# TAB 3 — TEST ROUTER
+# TAB 4 — TEST ROUTER
 # ════════════════════════════════════════════════════
 with tab_test:
     st.subheader("💬 Test Message Router")
     st.caption("اختبر رسالة مباشرة — النتيجة تظهر هنا والـ Activity Log يتحدث")
 
-    test_msg = st.text_input("الرسالة:", placeholder='مثال: "كيف أتعلم Python؟" أو "خلصت الدرس"')
-    if st.button("▶️ إرسال", type="primary") and test_msg:
-        with st.spinner("الـ agents تعمل..."):
-            reply = orc.handle_message(demo_user_id, test_msg)
-        st.success("**الرد:**")
-        st.write(reply)
-        st.info("📡 راجع تبويب Agent Activity لترى تفاصيل القرارات")
+    _quick = [
+        "كيف أتعلم Python؟",
+        "خلصت الدرس اليوم",
+        "أبي تغيير في الخطة",
+        "وين أتعلم من؟",
+        "هذا المستوى سهل بالنسبة لي",
+        "ما فيه فايدة، تعبت",
+    ]
+    test_msg = st.text_input(
+        "الرسالة:",
+        placeholder='مثال: "كيف أتعلم Python؟" أو "خلصت الدرس"',
+        label_visibility="collapsed",
+    )
+    st.caption("💡 رسائل سريعة:")
+    _qcols = st.columns(len(_quick))
+    for _qc, _qt in zip(_qcols, _quick):
+        if _qc.button(_qt, use_container_width=True):
+            test_msg = _qt
+
+    if st.button("▶️ إرسال", type="primary", use_container_width=True) and test_msg:
+        import asyncio as _asyncio
+        _t0 = time.time()
+        with st.spinner("⚙️ الـ agents تعمل..."):
+            try:
+                if _asyncio.iscoroutinefunction(orc.handle_message):
+                    reply = _asyncio.run(orc.handle_message(demo_user_id, test_msg))
+                else:
+                    reply = orc.handle_message(demo_user_id, test_msg)
+            except Exception as _e:
+                reply = f"❌ Error: {_e}"
+        _elapsed = round((time.time() - _t0) * 1000)
+        st.markdown(
+            f'<div style="background:#0f2027;border:1px solid #22c55e33;border-radius:10px;'
+            f'padding:16px 20px;margin-top:10px;">'
+            f'<div style="display:flex;justify-content:space-between;margin-bottom:8px;">'
+            f'<span style="color:#22c55e;font-weight:700;font-size:13px;">✅ رد الوكيل</span>'
+            f'<span style="color:#4b5563;font-size:11px;">⏱ {_elapsed}ms</span></div>'
+            f'<div style="color:#e2e8f0;font-size:14px;line-height:1.7;white-space:pre-wrap;">{reply}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        st.caption("📡 راجع تبويب Agent Activity لترى تفاصيل القرارات الداخلية")
+
 # ════════════════════════════════════════════════════
 # TAB 5 — SEMANTIC DEPENDENCY GRAPH
 # ════════════════════════════════════════════════════
@@ -548,7 +754,6 @@ with tab_graph:
     _cons_c   = {"proceed": _G, "proceed_adjusted": _B,
                  "simplify": _Y, "rebuild": _R}.get(cons_action, _GR)
 
-    # All hex colours used (for arrowhead markers)
     _used_hex = {
         _G, _R, _Y, _B, _P, _GR, _rc2c, _cons_c,
         _c(_in_cq, _G), _c(_in_daily, _G), _c(_in_plan, _B), _c(_in_gap, _R),
@@ -556,7 +761,6 @@ with tab_graph:
     }
     _markers_svg = "".join(_marker(h) for h in _used_hex)
 
-    # Edge list
     _fixer_rebuild_c = _c(fixer_on and fixer_via == "streak", _R)
     _edges_svg = "".join([
         _edge("user",       "router",     _P,                        2.5),
@@ -587,7 +791,6 @@ with tab_graph:
         _edge("fixer",      "output",     _c(fixer_on,   _G), _w(fixer_on)),
     ])
 
-    # Node definitions
     _node_defs = [
         ("user",       ["User Input"],   28),
         ("router",     ["Router"],       26),
@@ -605,7 +808,6 @@ with tab_graph:
     ]
     _nodes_svg = "".join(_node(nid, lines, r) for nid, lines, r in _node_defs)
 
-    # Node emoji labels (separate text above each node)
     _emoji_map = {
         "user": ("💬", 50), "router": ("⚙️", 140), "researcher": ("🔍", 265),
         "coach": ("🎓", 265), "consensus": ("🤝", 265), "planner": ("📋", 265),
@@ -619,7 +821,6 @@ with tab_graph:
         for nid, (em, _) in _emoji_map.items()
     )
 
-    # Layer separators and labels
     _SW, _SH = 920, 540
     _seps = "".join(
         f'<line x1="20" y1="{y}" x2="{_SW-20}" y2="{y}" '
@@ -643,7 +844,6 @@ with tab_graph:
 
     st.html(f'<div style="overflow-x:auto;padding:4px 0">{_svg}</div>')
 
-    # State summary
     st.divider()
     _g1, _g2, _g3, _g4, _g5 = st.columns(5)
     _route_lbl = {

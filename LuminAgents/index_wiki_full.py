@@ -8,11 +8,9 @@ import re
 import json
 import torch
 
-import os as _os
-_BASE     = _os.path.dirname(_os.path.abspath(__file__))
-ZIM_PATH  = _os.path.join(_BASE, "wikipedia_en_all_nopic_2026-03.zim")
-DB_PATH   = _os.path.join(_BASE, "db", "LuminAgents_Full_Wiki")
-CKPT_PATH = _os.path.join(_BASE, "db", "index_checkpoint.json")
+ZIM_PATH = r"D:\Apps\LuminAgents\wikipedia_en_all_nopic_2026-03.zim"
+DB_PATH  = r"D:\Apps\LuminAgents\db\LuminAgents_Full_Wiki"
+CKPT_PATH = r"D:\Apps\LuminAgents\db\index_checkpoint.json"
 BATCH_SIZE = 40000
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
