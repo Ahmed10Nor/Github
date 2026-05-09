@@ -1,0 +1,2291 @@
+# orchestrator.py
+# ═══════════════════════════════════════════════════════════════
+# LuminAgents — Orchestrator (Architecture v2)
+# Async pipeline | FSM onboarding | Hybrid router | Date-sync
+# Public interface stays sync for Telegram bot + test compat.
+# ═══════════════════════════════════════════════════════════════
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import re
+from datetime import date, datetime
+from typing import Optional
+
+import aiosqlite
+
+import db.database as _db_module
+from agents.coach import CoachAgent
+from agents.fixer import FixerAgent
+from agents.onboarding import OnboardingAgent
+from agents.planner import PlannerAgent, snapshot_to_human
+from agents.researcher import ResearcherAgent, _generate_video_query, fetch_first_source_url, fetch_learning_package
+from db.database import get_connection, log_agent
+from llm.llm_client import call_llm, async_call_llm
+from models.schemas import ArchivedSkill, FixerTrigger, OnboardingInput, UserProfile
+from tools.consensus import run_consensus
+from tools.message_router import (
+    detect_language,
+    get_out_of_scope_reply,
+    route_message,
+    _EN_PLAN_STATUS_RE,
+    _AR_PLAN_STATUS_WORDS,
+    _ar_matches,
+    _AR_GOAL_RESET_WORDS,
+    _EN_GOAL_RESET_RE,
+)
+from tools.semantic_intent import build_smart_greeting
+
+DEMO_MODE = os.getenv("DEMO_MODE", "false").lower() == "true"
+
+# ─── Identity-change patterns (Hazem Protocol — v5.4) ────────
+# Matches: "سمّني حازم", "اسمك الآن Hazem", "change your name to X", "be strict"
+_IDENTITY_NAME_RE = re.compile(
+    r'(?:'
+    r'(?:سمّ?[ني]+|اسم[كك]|نادي[ني]?|عدّل اسم[كك]?|غيّر اسم[كك]?)\s+(\S+)'
+    r'|(?:change\s+your\s+name\s+to|call\s+yourself|your\s+name\s+is\s+now|rename\s+(?:yourself\s+)?to)\s+(\S+)'
+    r')',
+    re.IGNORECASE,
+)
+_IDENTITY_VIBE_RE = re.compile(
+    r'(?:'
+    r'(?:كن|أسلوبك|روحك|أصبح)\s+(صارم|حاد|رسمي|لطيف|ودّي|مشجّع|محفز)'
+    r'|(?:be|act|sound)\s+(strict|gentle|motivational|formal|friendly|tough|easy|hard)'
+    r')',
+    re.IGNORECASE,
+)
+_AR_VIBE_MAP = {
+    "صارم": "strict", "حاد": "strict", "رسمي": "formal",
+    "لطيف": "gentle", "ودّي": "friendly", "مشجّع": "motivational", "محفز": "motivational",
+}
+
+# ─── Static greetings — Lumin persona, zero LLM cost ──────────
+GREETING_AR = (
+    "✨ أنا Lumin — مدربك الشخصي للمهارات.\n\n"
+    "أبني لك خطة تعلم مخصصة بالكامل، خطوة بخطوة، بناءً على وقتك ومستواك.\n\n"
+    "أخبرني في رسالة واحدة:\n"
+    "• اسمك\n"
+    "• المهارة التي تريد إتقانها\n"
+    "• مستواك فيها (مبتدئ / متوسط / متقدم)\n"
+    "• كم ساعة يومياً وكم يوماً في الأسبوع\n\n"
+    "مثال: أنا سارة، أريد تعلم تحليل البيانات، مستواي مبتدئ، ساعتان يومياً، 4 أيام"
+)
+GREETING_EN = (
+    "✨ I'm Lumin — your personal skill coach.\n\n"
+    "I'll build you a fully customized learning plan, step by step, "
+    "based on your schedule and level.\n\n"
+    "Tell me in one message:\n"
+    "• Your name\n"
+    "• The skill you want to master\n"
+    "• Your current level (beginner / intermediate / advanced)\n"
+    "• Daily hours and days per week\n\n"
+    "Example: I'm Ahmed, I want to learn Python, I'm a beginner, 1 hour/day, 5 days"
+)
+
+LEVEL_Q_AR = "أهلاً {name}! ما مستواك الحالي في {goal}؟ (مبتدئ / متوسط / متقدم)"
+LEVEL_Q_EN = "Hey {name}! What is your current level in {goal}? (beginner / intermediate / advanced)"
+
+
+# ─── Regex route — Tier 1 of hybrid router ───────────────────
+_GREETING_PATTERNS = [
+    r"^(أهلاً?|هلا|مرحبا?ً?|السلام عليكم|صباح الخير|مساء الخير|كيفك|ايش الاخبار|وش الاخبار|كيف حالك)[\s!،.]*$",
+    r"^(hi+|hello|hey|good\s+(morning|evening|day)|how are you|sup|yo|howdy)[\s!.]*$",
+]
+
+def _is_greeting(message: str) -> bool:
+    """Tier-0: pure greeting — zero LLM, zero regex overhead."""
+    text = message.strip()
+    return any(re.match(p, text, re.IGNORECASE) for p in _GREETING_PATTERNS)
+
+
+# ─── Completion signal detection (for milestone verdict) ─────
+_COMPLETION_AR = frozenset([
+    "خلصت", "انتهيت", "كملت", "أنهيت", "انجزت", "أنجزت",
+    "خلاص", "خلصنا", "كمّلت", "فرغت", "سويتها", "سويتهم", "انتهينا",
+])
+_COMPLETION_EN_RE = re.compile(
+    r'\b(done|finished|completed|all\s+done|did\s+it|i\s+did|checked\s+off|all\s+set)\b',
+    re.IGNORECASE,
+)
+
+def _detect_completion(message: str, language: str) -> bool:
+    """Returns True if the message signals task completion."""
+    if language == "ar":
+        msg_lower = message.lower()
+        return any(word in msg_lower for word in _COMPLETION_AR)
+    return bool(_COMPLETION_EN_RE.search(message))
+
+
+def _video_warranted(profile, gap_result) -> bool:
+    """
+    Autonomous video-inclusion decision — no agent self-routing, pure logic.
+
+    Rules:
+    • Advanced user + no comprehension gap → lean response, skip video.
+      Expert users don't need hand-holding on topics they've already grasped.
+    • All other cases (beginner/intermediate, or any gap detected regardless
+      of level) → include video reinforcement.
+
+    gap_result.gap_detected acts as the primary complexity signal:
+    if Researcher flagged shallow understanding, video is always warranted
+    even for advanced users.
+    """
+    if profile.level == "advanced" and not gap_result.gap_detected:
+        return False
+    return True
+
+
+def _regex_route(message: str) -> str:
+    """Returns route name or 'uncertain' when no strong pattern matches.
+    Delegates to route_message() which handles Arabic correctly (no \\b boundary issues).
+    'daily_check' from pattern matching means no strong signal → escalate to LLM.
+    """
+    route = route_message(message, None)
+    return "uncertain" if route == "daily_check" else route
+
+
+# ─── JSON extraction helper ───────────────────────────────────
+def _parse_json(raw: str) -> dict:
+    raw = re.sub(r"```[a-z]*", "", raw).replace("```", "").strip()
+    # greedy — captures outermost { ... }
+    m = re.search(r"\{[\s\S]*\}", raw)
+    if not m:
+        raise ValueError("no JSON found")
+    return json.loads(m.group())
+
+
+# ══════════════════════════════════════════════════════════════
+class LuminAgentsOrchestrator:
+
+    def __init__(self):
+        self.onboarding  = OnboardingAgent()
+        self.planner     = PlannerAgent()
+        self.researcher  = ResearcherAgent()
+        self.coach       = CoachAgent()
+        self.fixer       = FixerAgent()
+        # v6.9: real-time evaluation state — tracks pending exercise per user
+        self._pending_eval: dict = {}  # user_id → exercise_description
+        # v7.0: language preference memory — persists within session
+        self._lang_pref: dict = {}     # user_id → "ar" | "en" (preferred explanation lang)
+
+    # ══════════════════════════════════════════════════════════
+    # PUBLIC SYNC INTERFACE — backward-compatible with tests
+    # ══════════════════════════════════════════════════════════
+
+    def handle_new_user(self, data: OnboardingInput) -> dict:
+        return asyncio.run(self._handle_new_user_async(data))
+
+    def handle_message(self, user_id: str, message: str) -> str:
+        return asyncio.run(self._handle_message_async(user_id, message))
+
+    def get_progress(self, user_id: str) -> dict:
+        profile = self._get_profile(user_id)
+        if not profile:
+            return {}
+        streak = self.coach._get_streak(user_id)
+        return {
+            "user_id":         user_id,
+            "goal":            profile.goal,
+            "estimated_weeks": profile.estimated_weeks,
+            "failure_streak":  streak,
+        }
+
+    def get_plan(self, user_id: str) -> dict:
+        conn = get_connection()
+        rows = conn.execute(
+            "SELECT * FROM milestones WHERE user_id = ? ORDER BY week_start",
+            (user_id,),
+        ).fetchall()
+        conn.close()
+        return {"milestones": [dict(r) for r in rows]}
+
+    def _get_profile(self, user_id: str) -> Optional[UserProfile]:
+        """Sync — preserved for test patching and telegram_bot compatibility."""
+        conn = get_connection()
+        row  = conn.execute(
+            "SELECT * FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        conn.close()
+        return UserProfile(**dict(row)) if row else None
+
+    async def _get_profile_async(self, user_id: str) -> Optional[UserProfile]:
+        """Async version — used after _create_partial_user to read the stub back."""
+        async with aiosqlite.connect(str(_db_module.DB_PATH)) as conn:
+            conn.row_factory = aiosqlite.Row
+            async with conn.execute(
+                "SELECT * FROM users WHERE user_id = ?", (user_id,)
+            ) as cur:
+                row = await cur.fetchone()
+        return UserProfile(**dict(row)) if row else None
+
+    # ══════════════════════════════════════════════════════════
+    # ASYNC CORE — invoked via asyncio.run() in public methods
+    # ══════════════════════════════════════════════════════════
+
+    async def _handle_new_user_async(self, data: OnboardingInput) -> dict:
+        existing = self._get_profile(data.user_id)
+        if existing:
+            lang   = getattr(data, "language", "en")
+            prompt = (
+                f"المستخدم {data.name} مسجل بالفعل وهدفه {existing.goal}. "
+                f"أخبره بلطف أنه مسجل وذكّره بهدفه. جملة واحدة بالعربية."
+                if lang == "ar"
+                else
+                f"User {data.name} is already registered with goal: {existing.goal}. "
+                f"Politely tell them they're already set up. One sentence in English."
+            )
+            return {
+                "profile": existing,
+                "plan":    self.get_plan(data.user_id),
+                "message": call_llm(prompt),
+            }
+
+        profile       = self.onboarding.run(data)
+        macro, _micro = await self.planner.build(profile)
+        await self._mark_onboarding_complete(data.user_id)
+        profile.onboarding_complete = 1
+        return {"profile": profile, "plan": macro}
+
+    async def _handle_message_async(self, user_id: str, message: str) -> str:
+        _t0 = datetime.now()
+        profile = self._get_profile(user_id)   # sync — patched correctly in tests
+
+        # ── New user: semantic intent → smart greeting ────────
+        if not profile:
+            lang = detect_language(message)
+            intent, reply = build_smart_greeting(message, lang)
+            await self._create_partial_user(user_id, lang)
+            log_agent(user_id, "orchestrator", "new_user",
+                      f"مستخدم جديد — intent={intent} (0 tokens)",
+                      route="onboarding", tokens_est=0)
+
+            # If user gave full profile in message 1 → skip greeting, go straight to FSM
+            if intent == "full_profile":
+                log_agent(user_id, "orchestrator", "fsm_onboarding",
+                          "full_profile في رسالة 1 → extraction مباشرة", route="onboarding", tokens_est=210)
+                stub = await self._get_profile_async(user_id)
+                if stub:
+                    return await self._handle_onboarding_step(stub, message)
+
+            return reply
+
+        # ── Empty message guard ───────────────────────────────
+        if not message or not message.strip():
+            prompt = (
+                f"المستخدم {profile.name} أرسل رسالة فارغة. اطلب منه بلطف أن يكتب شيئاً. جملة واحدة."
+                if profile.language == "ar"
+                else f"User {profile.name} sent an empty message. Politely ask them to type something. One sentence."
+            )
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, lambda: call_llm(prompt))
+
+        # ── FSM: onboarding incomplete ────────────────────────
+        if profile.onboarding_complete == 0:
+            log_agent(user_id, "orchestrator", "fsm_onboarding", f"step={getattr(profile,'onboarding_step','?')} → LLM extraction", route="onboarding", tokens_est=210)
+            return await self._handle_onboarding_step(profile, message)
+
+        # ── Language detection + update ───────────────────────
+        detected = detect_language(message)
+        if detected != profile.language:
+            await self._update_language(user_id, detected)
+            profile.language = detected
+
+        # ── Date-sync: gap detection ──────────────────────────
+        gap = await self._check_date_gap(user_id)
+        if gap >= 2:
+            log_agent(user_id, "fixer", "gap_intervention", f"فجوة {gap} أيام → Fixer.intervene()", route="gap", tokens_est=150)
+            await self.fixer.intervene(
+                profile, FixerTrigger(reason="gap", gap_days=gap)
+            )
+
+        # ── Normal routing ────────────────────────────────────
+        return await self._handle_routed_message(profile, message)
+
+    # ══════════════════════════════════════════════════════════
+    # FSM ONBOARDING
+    # ══════════════════════════════════════════════════════════
+
+    async def _handle_onboarding_step(self, profile: UserProfile, message: str) -> str:
+        step = getattr(profile, "onboarding_step", "awaiting_goal")
+        if step in ("awaiting_goal", "awaiting_level"):
+            return await self._fsm_onboard(profile, message)
+        # edge case: step='complete' but flag still 0 — fix and route
+        await self._mark_onboarding_complete(profile.user_id)
+        return await self._handle_routed_message(profile, message)
+
+    async def _fsm_onboard(self, profile: UserProfile, message: str) -> str:
+        """
+        One-shot extraction: name + goal + category + level + hours + days.
+        - All present  → build plan immediately (zero follow-up questions)
+        - level missing → ask only for level
+        - goal missing  → ask for goal + level
+        """
+        lang = profile.language
+
+        # ── Merge with any previously collected partial data ──
+        partial: dict = {}
+        if profile.partial_profile:
+            try:
+                partial = json.loads(profile.partial_profile)
+            except Exception:
+                partial = {}
+
+        if DEMO_MODE:
+            name     = partial.get("name", "مستخدم")
+            goal     = partial.get("goal", message.strip() or "تعلم Python")
+            category = partial.get("category", "academic")
+            # In awaiting_level: normalize Arabic level words, reject non-level input
+            if profile.onboarding_step == "awaiting_level":
+                _lv_raw = message.strip().lower()
+                _lv_map = {"مبتدئ":"beginner","مبتدي":"beginner","beginner":"beginner",
+                           "متوسط":"intermediate","intermediate":"intermediate",
+                           "متقدم":"advanced","advanced":"advanced"}
+                level = _lv_map.get(_lv_raw, None)
+                # لو ما تعرفنا المستوى → نسأل مجدداً (لا نقبل "هلا" كـ beginner)
+            else:
+                level = None
+            h = float(partial.get("hours", 1.0))
+            d = int(partial.get("days", 5))
+        else:
+            # Pipe-separated format — avoids Arabic JSON token bloat
+            prompt = (
+                f'From this message: "{message}"\n'
+                f"Extract and return EXACTLY this format (one line, pipe-separated):\n"
+                f"NAME|GOAL|CATEGORY|LEVEL|HOURS|DAYS\n\n"
+                f"Rules:\n"
+                f"- NAME: first name only, or NONE\n"
+                f"- GOAL: skill name in English only (e.g. Python, cooking, photography). MUST be English.\n"
+                f"- CATEGORY: MUST be exactly one of: academic / professional / personal / physical\n"
+                f"- LEVEL: MUST be exactly one of: beginner / intermediate / advanced / NONE\n"
+                f"- HOURS: daily hours as decimal number only (e.g. 0.5, 1.0, 2.0), or NONE\n"
+                f"  Arabic: ساعة=1, ساعتين=2, نص ساعة=0.5, ربع=0.25\n"
+                f"- DAYS: days per week as integer 1-7 only, or NONE\n\n"
+                f"Arabic level mapping: مبتدئ=beginner, متوسط=intermediate, متقدم=advanced\n\n"
+                f"Example: Ahmed|Python|academic|beginner|1.5|5\n"
+                f"Example: NONE|pizza cooking|personal|beginner|0.5|5\n"
+                f"Example: NONE|fitness|physical|NONE|NONE|NONE\n\n"
+                f"Output one line only, no explanation:"
+            )
+            try:
+                loop = asyncio.get_event_loop()
+                raw  = await loop.run_in_executor(None, lambda: call_llm(prompt, max_tokens=100))
+                raw  = raw.strip().split("\n")[0].strip()
+                print(f"[FSM_ONBOARD RAW] {repr(raw)}")
+                parts = [p.strip() for p in raw.split("|")]
+                if len(parts) < 4:
+                    raise ValueError(f"bad format: {raw}")
+
+                name    = "" if parts[0].upper() == "NONE" else parts[0]
+                goal_en = "" if parts[1].upper() == "NONE" else parts[1]
+
+                # normalize category — handle Arabic fallback
+                _cat_raw = parts[2].lower() if len(parts) > 2 else ""
+                _cat_map = {
+                    "أكاديمي":"academic",  "اكاديمي":"academic",
+                    "مهني":"professional", "احترافي":"professional", "مهنية":"professional",
+                    "شخصي":"personal",     "شخصية":"personal",
+                    "رياضي":"physical",    "بدني":"physical",    "لياقة":"physical",
+                }
+                _valid = ("academic","professional","personal","physical")
+                category = _cat_raw if _cat_raw in _valid else _cat_map.get(_cat_raw, "academic")
+
+                # normalize level — handle Arabic fallback
+                _lv_raw = parts[3].lower() if len(parts) > 3 else "none"
+                _lv_map = {"مبتدئ":"beginner","متوسط":"intermediate","متقدم":"advanced",
+                           "مبتدي":"beginner","مبتدأ":"beginner"}
+                lv    = _lv_map.get(_lv_raw, _lv_raw)
+                level = lv if lv in ("beginner","intermediate","advanced") else None
+
+                goal = partial.get("goal", "") or goal_en
+
+                try:
+                    _h = float(parts[4]) if len(parts) > 4 and parts[4].upper() != "NONE" else None
+                    h  = _h if _h and 0.1 <= _h <= 12 else float(partial.get("hours", 1.0))
+                except (ValueError, IndexError):
+                    h = float(partial.get("hours", 1.0))
+
+                try:
+                    _d = int(float(parts[5])) if len(parts) > 5 and parts[5].upper() != "NONE" else None
+                    d  = _d if _d and 1 <= _d <= 7 else int(partial.get("days", 5))
+                except (ValueError, IndexError):
+                    d = int(partial.get("days", 5))
+
+            except Exception as e:
+                print(f"[FSM_ONBOARD LLM ERROR] {type(e).__name__}: {e}")
+                name     = partial.get("name", "")
+                goal     = partial.get("goal", message.strip())
+                category = partial.get("category", "academic")
+                level    = None
+                h        = float(partial.get("hours", 1.0))
+                d        = int(partial.get("days", 5))
+
+        # ── Decide: ready to build, or need more info? ────────
+        default_name = ("صديقي" if lang == "ar" else "friend")
+        display_name = name or default_name
+
+        if not goal or len(goal.strip()) < 2:
+            # No goal yet — save what we have, ask for goal+level
+            await self._update_partial_profile(
+                profile.user_id,
+                {"name": name, "category": category, "hours": h, "days": d},
+                new_step="awaiting_goal",
+            )
+            return (
+                f"أهلاً {display_name}! ما المهارة أو الهدف الذي تريد تطويره، وما مستواك فيه؟"
+                if lang == "ar"
+                else f"Hey {display_name}! What skill or goal do you want to work on, and what's your level?"
+            )
+
+        if not level:
+            # Have goal but no level — save progress including h/d, ask only for level
+            await self._update_partial_profile(
+                profile.user_id,
+                {"name": name, "goal": goal, "category": category, "hours": h, "days": d},
+                new_step="awaiting_level",
+            )
+            return (
+                LEVEL_Q_AR.format(name=display_name, goal=goal)
+                if lang == "ar"
+                else LEVEL_Q_EN.format(name=display_name, goal=goal)
+            )
+
+        # ── v5.4 Resurrection: check if this goal was archived before ──
+        archived = self._check_resurrection(profile.user_id, goal)
+        if archived:
+            log_agent(profile.user_id, "orchestrator", "resurrection_detected",
+                      f"مهارة مؤرشفة وُجدت: {archived.goal} ({archived.milestone_reached}/{archived.total_milestones})",
+                      route="onboarding", tokens_est=60)
+            if DEMO_MODE:
+                recap = (
+                    f"مرحباً بعودتك إلى {archived.goal}! وصلت سابقاً إلى {archived.milestone_reached}/{archived.total_milestones} مراحل."
+                    if lang == "ar"
+                    else f"Welcome back to {archived.goal}! You previously reached {archived.milestone_reached}/{archived.total_milestones} milestones."
+                )
+            else:
+                if lang == "ar":
+                    recap_prompt = (
+                        f"المستخدم {display_name} عاد إلى مهارة سبق أن أرشفها: '{archived.goal}'.\n"
+                        f"تقدمه السابق: {archived.milestone_reached} من {archived.total_milestones} مراحل "
+                        f"({archived.success_rate:.0%} نجاح).\n"
+                        f"اكتب رسالة ترحيب بالعودة (جملتان) بالعربية: "
+                        f"ذكّره بتقدمه السابق، واقترح البدء من حيث توقف."
+                    )
+                else:
+                    recap_prompt = (
+                        f"User {display_name} is returning to a previously archived skill: '{archived.goal}'.\n"
+                        f"Prior progress: {archived.milestone_reached}/{archived.total_milestones} milestones "
+                        f"({archived.success_rate:.0%} success rate).\n"
+                        f"Write a 2-sentence welcome-back message in English: "
+                        f"acknowledge their prior progress and suggest resuming where they left off."
+                    )
+                loop = asyncio.get_event_loop()
+                recap = await loop.run_in_executor(None, lambda: call_llm(recap_prompt, max_tokens=200))
+            # Still build a fresh plan — but prepend the recap
+            # (fall through to plan-build below, recap is prepended to reply)
+        else:
+            recap = None
+
+        # ── All info present → build plan now ─────────────────
+        onboarding_input = OnboardingInput(
+            user_id=profile.user_id,
+            name=display_name,
+            goal=goal,
+            category=category,
+            level=level,
+            hours_per_day=h,
+            days_per_week=d,
+            language=lang,
+        )
+        loop = asyncio.get_event_loop()
+        log_agent(profile.user_id, "onboarding", "profile_complete",
+                  f"name={display_name} goal={goal} level={level} {h}h×{d}d → Planner.build()",
+                  route="onboarding", tokens_est=160)
+        full_profile  = await loop.run_in_executor(None, self.onboarding.run, onboarding_input)
+        log_agent(profile.user_id, "planner", "build",
+                  f"يبني خطة {full_profile.estimated_weeks} أسابيع لـ {goal}",
+                  route="onboarding", tokens_est=900)
+        macro, _micro = await self.planner.build(full_profile)
+        await self._mark_onboarding_complete(profile.user_id)
+
+        human_snapshot = snapshot_to_human(macro.snapshot, lang)
+        recap_prefix   = f"{recap}\n\n" if recap else ""
+
+        # ── First Task: read day-1 task from daily_tasks table ───────────
+        first_task_line = ""
+        try:
+            conn_t = get_connection()
+            t_row  = conn_t.execute(
+                "SELECT description FROM daily_tasks "
+                "WHERE user_id=? ORDER BY day ASC LIMIT 1",
+                (full_profile.user_id,),
+            ).fetchone()
+            conn_t.close()
+            if t_row and t_row[0]:
+                task_desc = t_row[0].strip()
+                first_task_line = (
+                    f"\n\n📌 **مهمتك الأولى:** {task_desc}"
+                    if lang == "ar"
+                    else f"\n\n📌 **Your first task:** {task_desc}"
+                )
+        except Exception:
+            pass
+
+        # ── Learning Package: multi-source synthesis (v6.8) ─────────────
+        # Returns Primary Guide + YouTube + Exercise for onboarding display.
+        first_source_section = ""
+        try:
+            log_agent(full_profile.user_id, "researcher", "learning_package_fetch",
+                      f"onboarding complete → fetching learning package for '{goal}'",
+                      route="onboarding", tokens_est=0)
+            pkg = await loop.run_in_executor(
+                None, fetch_learning_package,
+                goal, full_profile.level, full_profile.category, lang,
+            )
+            parts = []
+            if pkg.get("primary_url"):
+                label = pkg["primary_title"] or goal
+                if lang == "ar":
+                    parts.append(f"📚 **الدليل الأساسي:** [{label}]({pkg['primary_url']})")
+                else:
+                    parts.append(f"📚 **Primary Guide:** [{label}]({pkg['primary_url']})")
+            if pkg.get("youtube_url"):
+                yt_label = pkg.get("youtube_title") or ("فيديو تعليمي" if lang == "ar" else "Video Tutorial")
+                if lang == "ar":
+                    parts.append(f"📺 **الدعم المرئي:** [{yt_label}]({pkg['youtube_url']})")
+                else:
+                    parts.append(f"📺 **Visual Support:** [{yt_label}]({pkg['youtube_url']})")
+            if pkg.get("exercise"):
+                if lang == "ar":
+                    parts.append(f"✏️ **تمرين عملي:** {pkg['exercise']}")
+                else:
+                    parts.append(f"✏️ **Actionable Exercise:** {pkg['exercise']}")
+            if parts:
+                if lang == "ar":
+                    header = "\n\n🎒 **حزمة التعلم الخاصة بك:**\n"
+                    footer = "\n💡 _افتح الدليل أولاً، ثم شاهد الفيديو، ثم نفّذ التمرين._"
+                else:
+                    header = "\n\n🎒 **Your Learning Package:**\n"
+                    footer = "\n💡 _Open the guide first, watch the video, then complete the exercise._"
+                first_source_section = header + "\n".join(parts) + footer
+        except Exception:
+            pass  # silent — never block onboarding completion
+
+        if lang == "ar":
+            return (
+                f"{recap_prefix}ممتاز {display_name}! 🎯 خطتك جاهزة.\n"
+                f"{human_snapshot}"
+                f"{first_task_line}"
+                f"{first_source_section}\n\n"
+                f"أخبرني عند الانتهاء من أول مهمة!"
+            )
+        return (
+            f"{recap_prefix}Great {display_name}! 🎯 Your plan is ready.\n"
+            f"{human_snapshot}"
+            f"{first_task_line}"
+            f"{first_source_section}\n\n"
+            f"Let me know when you finish your first task!"
+        )
+
+    # ══════════════════════════════════════════════════════════
+    # HYBRID ROUTER
+    # ══════════════════════════════════════════════════════════
+
+    async def _route(self, message: str, profile: UserProfile) -> str:
+        # Tier 0: pure greeting — only for onboarded users, zero LLM
+        if _is_greeting(message) and profile.onboarding_complete == 1:
+            return "greeting_checkin"
+        # Tier 1: regex — instant, free
+        route = _regex_route(message)
+        if route != "uncertain":
+            return route
+        # Tier 2: LLM — only for genuine gray areas
+        return await self._llm_route(message, profile)
+
+    async def _llm_route(self, message: str, profile: UserProfile) -> str:
+        """
+        Tier-2 smart router — called only when regex is uncertain.
+        Classifies across ALL routes so creative/unexpected phrasings are handled correctly.
+        Example: "أحس إن الطريق الصح هو إني أبدأ بشي جديد" → goal_reset
+                 "والله ما عارف وين وصلت" → daily_check
+                 "ممكن تشرح لي الـ recursion؟" → content_question
+        """
+        if DEMO_MODE:
+            return "daily_check"
+        prompt = (
+            f"You are a message classifier for a skills-coaching AI (LuminAgents).\n"
+            f"User's current goal: {profile.goal}\n"
+            f"User's message: \"{message}\"\n\n"
+            f"Classify the message into EXACTLY ONE of these routes:\n\n"
+            f"  goal_reset      — user wants to change their skill/goal entirely, start over, or try something new\n"
+            f"  plan_change     — user wants to modify their schedule, pace, difficulty, or says they're busy/overwhelmed\n"
+            f"  content_question — user is asking for explanation, concept, example, or info about their learning topic\n"
+            f"  out_of_scope    — user is asking about something completely unrelated to their goal (sports, news, politics, etc.)\n"
+            f"  daily_check     — anything else: progress update, task completion, general check-in, casual message\n\n"
+            f"Reply with ONLY the route name, nothing else."
+        )
+        loop = asyncio.get_event_loop()
+        raw = (await loop.run_in_executor(None, lambda: call_llm(prompt, max_tokens=15))).strip().lower()
+        # Map LLM output to valid route
+        for route in ("goal_reset", "plan_change", "content_question", "out_of_scope", "daily_check"):
+            if route in raw:
+                return route
+        return "daily_check"  # safe fallback
+
+    async def _handle_routed_message(self, profile: UserProfile, message: str) -> str:
+        _t0   = datetime.now()
+        loop  = asyncio.get_event_loop()
+
+        # ── v6.9: Real-Time Evaluation (pending_eval state) ────────────
+        # If the previous turn asked the user to write/practice something,
+        # the next message is evaluated by the LLM regardless of route.
+        uid = profile.user_id
+        if uid in self._pending_eval and message.strip():
+            exercise_ctx = self._pending_eval.pop(uid)
+            eval_reply = await loop.run_in_executor(
+                None, self._evaluate_user_submission, profile, message, exercise_ctx
+            )
+            log_agent(uid, "coach", "eval_submission",
+                      f"pending_eval → evaluated user input", route="eval", tokens_est=120)
+            # v7.5: mark eval done → background_discourse will see this and suppress
+            log_agent(uid, "orchestrator", "eval_complete",
+                      "exercise evaluated — suppress next background_discourse", route="eval")
+            return eval_reply
+
+        # ── Behavioral Pulse: proactive Fixer before any route ──────────
+        # v6.6: suppress for first 3 interactions of a fresh skill
+        _interactions = await loop.run_in_executor(
+            None, self._count_interactions_since_onboarding, profile.user_id
+        )
+        _fresh_skill = _interactions < 3
+
+        b_score = 0
+        if not _fresh_skill:
+            b_score = await loop.run_in_executor(
+                None, self._check_behavioral_pulse, profile.user_id
+            )
+        if b_score >= 2:
+            log_agent(profile.user_id, "fixer", "behavioral_pulse",
+                      f"behavioral_score={b_score} → proactive intervention",
+                      route="behavior", tokens_est=200)
+            fixer_report = await self.fixer.intervene(
+                profile,
+                FixerTrigger(reason="behavior", behavioral_score=b_score),
+            )
+            # fixer_report.message goes to DB/dashboard only — not surfaced as raw prefix
+            # The outbound user message is the clean fixer_report output (already LLM-generated)
+            # We do NOT prepend it here; background_discourse handles proactive outbound.
+            # In-band, we silently log — the user's request is served uninterrupted.
+            _behavior_prefix = ""
+        elif b_score == 1:
+            log_agent(profile.user_id, "fixer", "behavioral_pulse",
+                      f"behavioral_score={b_score} → warning logged (threshold=2)",
+                      route="behavior", tokens_est=0)
+            _behavior_prefix = ""
+        else:
+            _behavior_prefix = ""
+
+        # ── Hazem Protocol: identity change — highest priority ─
+        identity_reply = await self._handle_identity_change(profile, message)
+        if identity_reply is not None:
+            return identity_reply
+
+        # ── v7.5: Adaptive Challenge — "too easy" → force level up ──────
+        _EASY_AR = {"سهل", "سهلة", "سهل جداً", "بسيط", "بسيطة", "ما فيه تحدي",
+                    "أريد أصعب", "ابي اصعب", "أعطني أصعب", "زود الصعوبة"}
+        _EASY_EN_RE = re.compile(
+            r'\b(too easy|this is easy|way too easy|too simple|not challenging'
+            r'|give me harder|harder (content|material|task)|level up|more challenging)\b',
+            re.IGNORECASE
+        )
+        _is_easy_signal = any(w in message for w in _EASY_AR) or _EASY_EN_RE.search(message)
+        if _is_easy_signal and not DEMO_MODE:
+            _level_map = {"beginner": "intermediate", "intermediate": "advanced", "advanced": "advanced"}
+            _new_level = _level_map.get(profile.level, "intermediate")
+            if _new_level != profile.level:
+                try:
+                    _lc = get_connection()
+                    _lc.execute("UPDATE users SET level=? WHERE user_id=?", (_new_level, profile.user_id))
+                    _lc.commit()
+                    _lc.close()
+                    log_agent(profile.user_id, "orchestrator", "level_up",
+                              f"easy signal → level {profile.level} → {_new_level}", route="adaptive")
+                    profile = self._get_profile(profile.user_id) or profile
+                except Exception:
+                    pass
+            pkg = await loop.run_in_executor(
+                None, fetch_learning_package,
+                profile.goal, _new_level, profile.category, profile.language,
+            )
+            _lang = profile.language
+            pkg_parts = []
+            if pkg.get("primary_url"):
+                lbl = pkg["primary_title"] or profile.goal
+                pkg_parts.append(
+                    f"📚 **الدليل المتقدم:** [{lbl}]({pkg['primary_url']})"
+                    if _lang == "ar" else
+                    f"📚 **Advanced Guide:** [{lbl}]({pkg['primary_url']})"
+                )
+            if pkg.get("youtube_url"):
+                yt_lbl = pkg.get("youtube_title") or ("فيديو متقدم" if _lang == "ar" else "Advanced Video")
+                pkg_parts.append(
+                    f"📺 **الدعم المرئي:** [{yt_lbl}]({pkg['youtube_url']})"
+                    if _lang == "ar" else
+                    f"📺 **Visual Support:** [{yt_lbl}]({pkg['youtube_url']})"
+                )
+            if pkg.get("exercise"):
+                pkg_parts.append(
+                    f"✏️ **تحديك الجديد:** {pkg['exercise']}"
+                    if _lang == "ar" else
+                    f"✏️ **Your New Challenge:** {pkg['exercise']}"
+                )
+            _level_label = {"intermediate": "المتوسط", "advanced": "المتقدم"}.get(_new_level, _new_level) if _lang == "ar" else _new_level.capitalize()
+            if pkg_parts:
+                _hdr = (
+                    f"⬆️ ممتاز! رفعت مستواك إلى **{_level_label}**. حزمتك الجديدة:\n\n"
+                    if _lang == "ar" else
+                    f"⬆️ Great! Leveling you up to **{_level_label}**. Your new package:\n\n"
+                )
+                return _hdr + "\n".join(pkg_parts)
+            else:
+                return (
+                    f"⬆️ رفعت مستواك إلى {_level_label}! ابحث هنا عن تحديات أصعب:\n"
+                    f"https://www.youtube.com/results?search_query={profile.goal.replace(' ', '+')}+{_new_level}"
+                    if _lang == "ar" else
+                    f"⬆️ Leveled up to {_level_label}! Find harder challenges here:\n"
+                    f"https://www.youtube.com/results?search_query={profile.goal.replace(' ', '+')}+{_new_level}"
+                )
+
+        route = await self._route(message, profile)
+        _route_ms = int((datetime.now() - _t0).total_seconds() * 1000)
+        log_agent(profile.user_id, "orchestrator", "route_decision",
+                  f"'{message[:40]}' → {route}", route=route, duration_ms=_route_ms)
+
+        if route == "greeting_checkin":
+            # Fixer always has priority — even greetings must pass through streak check
+            report = await loop.run_in_executor(None, self.coach.daily_task, profile, "")
+            if report.failure_streak >= 3:
+                log_agent(profile.user_id, "fixer", "streak_intervention",
+                          f"greeting with streak={report.failure_streak} >= 3 → Fixer",
+                          route=route, tokens_est=350)
+                fixer_report = await self.fixer.intervene(
+                    profile,
+                    FixerTrigger(reason="streak", streak_count=report.failure_streak),
+                )
+                rebuild_msg = await loop.run_in_executor(None, self.planner.rebuild, profile)
+                return f"{fixer_report.message}\n\n{rebuild_msg}"
+            log_agent(profile.user_id, "orchestrator", "greeting_checkin",
+                      "تحية → Coach يرد بترحيب + مهمة اليوم بأسلوب طبيعي", route=route, tokens_est=120)
+            return await loop.run_in_executor(None, self._greeting_with_task, profile)
+
+        elif route == "out_of_scope":
+            log_agent(profile.user_id, "orchestrator", "out_of_scope",
+                      "رسالة خارج النطاق → LLM رد مخصص", route=route, tokens_est=80)
+            return get_out_of_scope_reply(profile)
+
+        elif route == "goal_reset":
+            log_agent(profile.user_id, "orchestrator", "goal_reset",
+                      "المستخدم يريد تغيير المهارة → حذف البيانات + إعادة onboarding",
+                      route=route, tokens_est=60)
+            return await loop.run_in_executor(None, self._handle_goal_reset, profile)
+
+        elif route == "content_question":
+            # v7.0: Language preference detection + memory
+            _LANG_AR_SIGNALS = {"بالعربي", "بالعربية", "باللغة العربية", "اشرح عربي", "جاوب بالعربي"}
+            _LANG_EN_SIGNALS = {"in english", "بالانجليزي", "بالإنجليزي"}
+            msg_lower = message.lower()
+            if any(s in msg_lower for s in _LANG_AR_SIGNALS) or "in arabic" in msg_lower:
+                self._lang_pref[profile.user_id] = "ar"
+            elif any(s in msg_lower for s in _LANG_EN_SIGNALS):
+                self._lang_pref[profile.user_id] = "en"
+            _expl_lang = self._lang_pref.get(profile.user_id, profile.language)
+
+            # v7.4: SOURCE INTERCEPT — if user asks for sources/links/where to study,
+            # bypass researcher.fetch entirely and go straight to fetch_learning_package.
+            # Prevents LLM synthesis from hallucinating course lists.
+            _SRC_AR = {"مصدر", "مصادر", "وين أتعلم", "ايش ادرس", "ماذا أدرس",
+                       "وين الروابط", "رابط", "روابط", "كورس", "دورة", "موقع", "ابدأ فيه"}
+            _SRC_EN_RE = re.compile(
+                r'\b(sources?|where (to|can I|should I) (study|learn|start)'
+                r'|what (to|should I) (study|learn|read|start with)'
+                r'|recommend|course|tutorial|website|resource|link)\b', re.IGNORECASE
+            )
+            _is_source_query = any(w in message for w in _SRC_AR) or _SRC_EN_RE.search(message)
+
+            if _is_source_query and not DEMO_MODE:
+                log_agent(profile.user_id, "researcher", "source_intercept",
+                          "source query intercepted → fetch_learning_package directly",
+                          route=route, tokens_est=0)
+                try:
+                    pkg = await loop.run_in_executor(
+                        None, fetch_learning_package,
+                        profile.goal, profile.level, profile.category, profile.language,
+                    )
+                    _lang = profile.language
+                    pkg_parts = []
+                    if pkg.get("primary_url"):
+                        lbl = pkg["primary_title"] or profile.goal
+                        pkg_parts.append(
+                            f"📚 **الدليل الأساسي:** [{lbl}]({pkg['primary_url']})"
+                            if _lang == "ar" else
+                            f"📚 **Primary Guide:** [{lbl}]({pkg['primary_url']})"
+                        )
+                    if pkg.get("youtube_url"):
+                        yt_lbl = pkg.get("youtube_title") or ("فيديو" if _lang == "ar" else "Video")
+                        pkg_parts.append(
+                            f"📺 **الدعم المرئي:** [{yt_lbl}]({pkg['youtube_url']})"
+                            if _lang == "ar" else
+                            f"📺 **Visual Support:** [{yt_lbl}]({pkg['youtube_url']})"
+                        )
+                    if pkg.get("exercise"):
+                        pkg_parts.append(
+                            f"✏️ **تمرين عملي:** {pkg['exercise']}"
+                            if _lang == "ar" else
+                            f"✏️ **Actionable Exercise:** {pkg['exercise']}"
+                        )
+                    if pkg_parts:
+                        _hdr = "🎒 **حزمة التعلم الخاصة بك:**\n" if _lang == "ar" else "🎒 **Your Learning Package:**\n"
+                        return _hdr + "\n".join(pkg_parts)
+                    else:
+                        # Tavily empty → return YouTube search only (never hallucinate)
+                        _yt_search = f"https://www.youtube.com/results?search_query={profile.goal.replace(' ', '+')}+{profile.level}+tutorial"
+                        return (
+                            f"📺 لم أجد مصادر مخصصة حالياً. ابحث هنا:\n{_yt_search}"
+                            if profile.language == "ar" else
+                            f"📺 No verified sources found right now. Search here:\n{_yt_search}"
+                        )
+                except Exception:
+                    _yt_search = f"https://www.youtube.com/results?search_query={profile.goal.replace(' ', '+')}+tutorial"
+                    return (
+                        f"📺 ابحث عن مصادر هنا:\n{_yt_search}"
+                        if profile.language == "ar" else
+                        f"📺 Search for resources here:\n{_yt_search}"
+                    )
+
+            if not DEMO_MODE:
+                rel_prompt = (
+                    f"Is this question about learning '{profile.goal}' "
+                    f"OR about the user's learning plan, schedule, weeks, milestones, or progress? "
+                    f"Answer only YES or NO.\nQuestion: {message}"
+                )
+                relevance = (await loop.run_in_executor(None, lambda: call_llm(rel_prompt, max_tokens=10))).strip().upper()
+                if not relevance.startswith("YES"):
+                    log_agent(profile.user_id, "orchestrator", "relevance_check",
+                              "سؤال غير مرتبط بالهدف → out_of_scope", route="out_of_scope", tokens_est=40)
+                    return get_out_of_scope_reply(profile)
+
+            log_agent(profile.user_id, "researcher", "fetch",
+                      f"يبحث: '{message[:40]}' في KB → Wiki → Web", route=route, tokens_est=0)
+            _tr = datetime.now()
+            research = await self.researcher.fetch(message, profile)
+            _res_ms = int((datetime.now() - _tr).total_seconds() * 1000)
+            sources = ", ".join(research.sources) if research.sources else "none"
+            chunks_n = len(research.chunks)
+            log_agent(profile.user_id, "researcher", "fetch_result",
+                      f"وجد {chunks_n} chunk(s) — المصدر: {sources}", route=route,
+                      duration_ms=_res_ms)
+
+            if research.chunks and research.chunks[0] == "NO_INFO":
+                log_agent(profile.user_id, "researcher", "no_info",
+                          "سجلات Librarian غير مكتملة → يطلب المصدر من المستخدم", route=route)
+                # The Librarian persona: incomplete records → ask user for their source
+                if profile.language == "ar":
+                    no_info_prompt = (
+                        f"أنت 'The Librarian' في LuminAgents — دقيق ومنهجي، تبلّغ فقط بما هو موثّق في سجلاتك.\n"
+                        f"سجلاتك غير مكتملة عن هذا الموضوع للمستخدم {profile.name}.\n"
+                        f"أخبره في جملة واحدة بالعربية أن سجلاتك غير مكتملة، "
+                        f"واطلب منه تزويدك بمصدره (كتاب، فصل، رابط) لتتمكن من دمجه في خطته."
+                    )
+                else:
+                    no_info_prompt = (
+                        f"You are 'The Librarian' in LuminAgents — methodical and precise. "
+                        f"You only report what is verified in your records.\n"
+                        f"Your records are incomplete on this topic for {profile.name}.\n"
+                        f"Tell them in one sentence that your records are incomplete, "
+                        f"and ask them to share their source (book, chapter, or link) "
+                        f"so you can integrate it into their plan."
+                    )
+                return await loop.run_in_executor(None, lambda: call_llm(no_info_prompt, max_tokens=100))
+
+            context = "\n".join(research.chunks) if research.chunks else ""
+
+            # v7.0: Transparency label — signal when answer is from LLM synthesis, not live source
+            _synthesis_note = ""
+            if research.fallback_used:
+                _synthesis_note = (
+                    "\n\n_(💡 هذا الشرح من معرفتي الداخلية — تحقق من مصدر حي للتأكيد.)_"
+                    if profile.language == "ar" else
+                    "\n\n_(💡 This explanation is from my internal knowledge — verify with a live source for accuracy.)_"
+                )
+
+            # ── Semantic Gap Analysis (v5.1) ──────────────────
+            gap_result = await loop.run_in_executor(
+                None, self.researcher.evaluate_comprehension, message, context, profile
+            )
+            if gap_result.gap_detected:
+                log_agent(profile.user_id, "researcher", "semantic_gap",
+                          f"فهم سطحي مكتشف → Coach يضيف Practical Challenge: {gap_result.challenge_hint[:80]}",
+                          route=route, tokens_est=80)
+            else:
+                log_agent(profile.user_id, "researcher", "semantic_gap",
+                          "فهم عميق ✓ — لا تدخل مطلوب", route=route, tokens_est=80)
+
+            log_agent(profile.user_id, "coach", "answer_question",
+                      f"Coach يولّد إجابة بسياق {chunks_n} chunk(s)"
+                      + (" + Practical Challenge" if gap_result.gap_detected else ""),
+                      route=route, tokens_est=400)
+            coach_answer = await loop.run_in_executor(
+                None, self.coach.answer_question,
+                message, context, profile,
+                gap_result.gap_detected, gap_result.challenge_hint,
+                _expl_lang,
+            )
+
+            # ── Stage-Gate: append lock reminder if current stage incomplete ─
+            stage = await loop.run_in_executor(
+                None, self._check_stage_gate, profile.user_id
+            )
+            if stage["locked"]:
+                lang       = profile.language
+                incomplete = stage["incomplete"]
+                total      = stage["total"]
+                week       = stage["current_week"]
+                # v6.5: validation-first tone — no internal "Stage-Gate" label visible to user
+                gate_note  = (
+                    f"\n\n✅ أفهم هدفك تماماً. دعنا نبني على ما بدأناه — "
+                    f"لديك {incomplete} مهمة متبقية هذا الأسبوع. "
+                    f"أكملها أولاً وسنتقدم للمرحلة التالية من تعلّم **{profile.goal}** بثقة."
+                    if lang == "ar"
+                    else
+                    f"\n\n✅ I understand your goal. Let's build on what we've started — "
+                    f"you have {incomplete} task{'s' if incomplete != 1 else ''} remaining this week. "
+                    f"Complete them first and we'll advance to the next stage of **{profile.goal}** with confidence."
+                )
+                log_agent(profile.user_id, "orchestrator", "stage_gate_locked",
+                          f"week={week} incomplete={incomplete}/{total}",
+                          route=route, tokens_est=0)
+            else:
+                gate_note = ""
+
+            # ── Video Intelligence: Autonomous Decision + Direct Watch URLs ──
+            if _video_warranted(profile, gap_result):
+                video_raw = _generate_video_query(message, context, profile)
+                if video_raw:
+                    lang  = profile.language
+                    label = "📺 تصفح تعليمي موصى به" if lang == "ar" else "📺 Recommended Tactical Briefing"
+                    links = [l.strip() for l in video_raw.strip().split("\n") if l.strip()]
+                    formatted = "\n".join(f"  • {l}" for l in links)
+                    log_agent(profile.user_id, "coach", "video_recommendation",
+                              f"level={profile.level} gap={gap_result.gap_detected} "
+                              f"→ {links[0][:80]}",
+                              route=route, tokens_est=30)
+                    return f"{_behavior_prefix}{coach_answer}{_synthesis_note}{gate_note}\n\n{label}:\n{formatted}"
+            else:
+                log_agent(profile.user_id, "coach", "video_skipped",
+                          f"level=advanced gap=False → lean response (no video overhead)",
+                          route=route, tokens_est=0)
+
+            # ── Learning Package: triggered when user asks for sources / what to study ──
+            _SOURCE_KEYWORDS_AR = {"مصادر", "مصدر", "ماذا أدرس", "ايش ادرس", "وين أتعلم", "كورس", "موقع"}
+            _SOURCE_RE_EN = re.compile(
+                r'\b(sources?|what (to|should I) (study|learn|read)|where (to|can I) learn'
+                r'|recommend|course|tutorial|website|resource)\b', re.IGNORECASE
+            )
+            _wants_package = _ar_matches(message, _SOURCE_KEYWORDS_AR) or _SOURCE_RE_EN.search(message)
+            if _wants_package and not DEMO_MODE:
+                try:
+                    pkg = await loop.run_in_executor(
+                        None, fetch_learning_package,
+                        profile.goal, profile.level, profile.category, profile.language,
+                    )
+                    pkg_parts = []
+                    _lang = profile.language
+                    if pkg.get("primary_url"):
+                        lbl = pkg["primary_title"] or profile.goal
+                        pkg_parts.append(
+                            f"📚 **الدليل الأساسي:** [{lbl}]({pkg['primary_url']})"
+                            if _lang == "ar" else
+                            f"📚 **Primary Guide:** [{lbl}]({pkg['primary_url']})"
+                        )
+                    if pkg.get("youtube_url"):
+                        yt_lbl = pkg.get("youtube_title") or ("فيديو" if _lang == "ar" else "Video")
+                        pkg_parts.append(
+                            f"📺 **الدعم المرئي:** [{yt_lbl}]({pkg['youtube_url']})"
+                            if _lang == "ar" else
+                            f"📺 **Visual Support:** [{yt_lbl}]({pkg['youtube_url']})"
+                        )
+                    if pkg.get("exercise"):
+                        pkg_parts.append(
+                            f"✏️ **تمرين عملي:** {pkg['exercise']}"
+                            if _lang == "ar" else
+                            f"✏️ **Actionable Exercise:** {pkg['exercise']}"
+                        )
+                    if pkg_parts:
+                        _header = "\n\n🎒 **حزمة التعلم:**\n" if _lang == "ar" else "\n\n🎒 **Your Learning Package:**\n"
+                        coach_answer += _header + "\n".join(pkg_parts)
+                        log_agent(profile.user_id, "researcher", "learning_package_content_q",
+                                  "source query → Learning Package appended", route=route, tokens_est=0)
+                except Exception:
+                    pass  # silent — never block the response
+
+            return f"{_behavior_prefix}{coach_answer}{_synthesis_note}{gate_note}"
+
+        elif route == "plan_change":
+            # ── Consensus Loop: Coach vs Fixer debate before plan revision ──
+            log_agent(profile.user_id, "orchestrator", "consensus_triggered",
+                      "plan_change → Consensus Engine يبدأ الجدال", route=route, tokens_est=0)
+            await run_consensus(profile, route, f"user_request: {message[:100]}")
+            log_agent(profile.user_id, "planner", "revise",
+                      f"تعديل الخطة: '{message[:40]}'", route=route, tokens_est=300)
+            revise_reply = await loop.run_in_executor(None, self.planner.revise, profile, message)
+            # v7.0: Force Fetch — if level change detected, refresh Learning Package immediately
+            _LEVEL_UP_RE = re.compile(
+                r'\b(advanced|intermediate|harder|level up|progress|increase|ارفع|متقدم|متوسط)\b',
+                re.IGNORECASE,
+            )
+            if _LEVEL_UP_RE.search(message) and not DEMO_MODE:
+                refreshed_profile = self._get_profile(profile.user_id)
+                new_level = refreshed_profile.level if refreshed_profile else profile.level
+                new_cat   = refreshed_profile.category if refreshed_profile else profile.category
+                log_agent(profile.user_id, "researcher", "force_fetch",
+                          f"level change → fetching new Learning Package (level={new_level})",
+                          route=route, tokens_est=0)
+                pkg = await loop.run_in_executor(
+                    None, fetch_learning_package,
+                    profile.goal, new_level, new_cat, profile.language,
+                )
+                parts = []
+                if pkg.get("primary_url"):
+                    lbl = pkg["primary_title"] or profile.goal
+                    parts.append(
+                        f"📚 **الدليل الجديد:** [{lbl}]({pkg['primary_url']})"
+                        if profile.language == "ar" else
+                        f"📚 **Updated Guide:** [{lbl}]({pkg['primary_url']})"
+                    )
+                if pkg.get("youtube_url"):
+                    yt_lbl = pkg.get("youtube_title") or ("فيديو" if profile.language == "ar" else "Video")
+                    parts.append(
+                        f"📺 **فيديو المستوى الجديد:** [{yt_lbl}]({pkg['youtube_url']})"
+                        if profile.language == "ar" else
+                        f"📺 **Video for new level:** [{yt_lbl}]({pkg['youtube_url']})"
+                    )
+                if parts:
+                    header = "\n\n🆕 **مصادرك الجديدة:**\n" if profile.language == "ar" else "\n\n🆕 **Fresh sources for your new level:**\n"
+                    revise_reply += header + "\n".join(parts)
+            return revise_reply
+
+        else:  # daily_check
+
+            # Meta/source query ("what are your sources", "where do you get info")
+            # → explain the KB, not the user's plan
+            _EN_META_RE = re.compile(
+                r'\b(sources?|your (knowledge|info|data|material|content)'
+                r'|where do you get|what do you use)\b',
+                re.IGNORECASE
+            )
+            _AR_META_WORDS = {"مصادر", "مصدر", "معلوماتك", "من أين تعرف", "كيف تعرف"}
+            if _ar_matches(message, _AR_META_WORDS) or _EN_META_RE.search(message):
+                log_agent(profile.user_id, "coach", "meta_info",
+                          "source/meta query → explain KB", route=route, tokens_est=60)
+                return await loop.run_in_executor(None, self._meta_reply, profile)
+
+            # Plan-status query ("how many weeks", "what's my plan", etc.)
+            # → answer directly from profile+DB, not coach.daily_task
+            if _ar_matches(message, _AR_PLAN_STATUS_WORDS) or _EN_PLAN_STATUS_RE.search(message):
+                log_agent(profile.user_id, "coach", "plan_info",
+                          "plan-status query → answer from profile+DB", route=route, tokens_est=80)
+                return await loop.run_in_executor(None, self._plan_info_reply, profile)
+
+            log_agent(profile.user_id, "coach", "daily_task",
+                      "daily_check → Coach reads task from DB", route=route, tokens_est=0)
+            report = await loop.run_in_executor(None, self.coach.daily_task, profile, message)
+            if report.failure_streak >= 3:
+                log_agent(profile.user_id, "fixer", "streak_intervention",
+                          f"failure_streak={report.failure_streak} >= 3 -> Fixer + Planner.rebuild()",
+                          route=route, tokens_est=350)
+                fixer_report = await self.fixer.intervene(
+                    profile,
+                    FixerTrigger(reason="streak", streak_count=report.failure_streak),
+                )
+                rebuild_msg = await loop.run_in_executor(None, self.planner.rebuild, profile)
+                return f"{fixer_report.message}\n\n{rebuild_msg}"
+            # ── Consensus Loop: early warning at streak = 2 ───────────
+            if report.failure_streak >= 2:
+                log_agent(profile.user_id, "orchestrator", "consensus_triggered",
+                          f"failure_streak={report.failure_streak} → Consensus Engine (تحذير مبكر)",
+                          route=route, tokens_est=0)
+                await run_consensus(
+                    profile, route,
+                    f"failure_streak={report.failure_streak}, user is at risk of hitting Fixer threshold",
+                )
+            # ── Completion detection → encouragement (v6.9) ─────────
+            if _detect_completion(message, profile.language) and report.day_index > 0:
+                await loop.run_in_executor(
+                    None, self.coach.mark_complete, profile.user_id, report.day_index
+                )
+                log_agent(profile.user_id, "coach", "task_complete",
+                          f"day={report.day_index} marked complete",
+                          route=route, tokens_est=80)
+                # LLM encouragement + what's next
+                encouragement = await loop.run_in_executor(
+                    None, self._completion_reply, profile, report
+                )
+                if not DEMO_MODE:
+                    milestone_done = await loop.run_in_executor(
+                        None, self._check_milestone_complete, profile.user_id
+                    )
+                    if milestone_done:
+                        verdict_suffix = await self._milestone_verdict(profile, milestone_done)
+                        if verdict_suffix:
+                            return f"{encouragement}{verdict_suffix}"
+                    # v7.4: Next Learning Package after completion
+                    try:
+                        pkg = await loop.run_in_executor(
+                            None, fetch_learning_package,
+                            profile.goal, profile.level, profile.category, profile.language,
+                        )
+                        pkg_parts = []
+                        _lang = profile.language
+                        if pkg.get("primary_url"):
+                            lbl = pkg["primary_title"] or profile.goal
+                            pkg_parts.append(
+                                f"📚 **الدليل:** [{lbl}]({pkg['primary_url']})"
+                                if _lang == "ar" else
+                                f"📚 **Guide:** [{lbl}]({pkg['primary_url']})"
+                            )
+                        if pkg.get("youtube_url"):
+                            yt_lbl = pkg.get("youtube_title") or ("فيديو" if _lang == "ar" else "Video")
+                            pkg_parts.append(
+                                f"📺 **الدعم المرئي:** [{yt_lbl}]({pkg['youtube_url']})"
+                                if _lang == "ar" else
+                                f"📺 **Visual Support:** [{yt_lbl}]({pkg['youtube_url']})"
+                            )
+                        if pkg.get("exercise"):
+                            pkg_parts.append(
+                                f"✏️ **تمرينك التالي:** {pkg['exercise']}"
+                                if _lang == "ar" else
+                                f"✏️ **Next Exercise:** {pkg['exercise']}"
+                            )
+                        if pkg_parts:
+                            _hdr = "\n\n🎒 **حزمة مهمتك التالية:**\n" if _lang == "ar" else "\n\n🎒 **Your next Learning Package:**\n"
+                            encouragement += _hdr + "\n".join(pkg_parts)
+                            log_agent(profile.user_id, "researcher", "learning_package_completion",
+                                      "task done → next Learning Package fetched", route=route, tokens_est=0)
+                    except Exception:
+                        pass
+                return encouragement
+            # ── Long message (> 2 words) → LLM understands (v6.9) ───
+            # Prevents "broken record" — bot acknowledges what user said.
+            if len(message.split()) > 2 and not DEMO_MODE:
+                log_agent(profile.user_id, "coach", "llm_daily_response",
+                          f"long message → LLM acknowledgment", route=route, tokens_est=120)
+                return await loop.run_in_executor(
+                    None, self._llm_daily_response, profile, message, report
+                )
+            return report.notes
+
+    def _completion_reply(self, profile: UserProfile, report) -> str:
+        """v6.9: LLM encouragement after task completion + next task nudge."""
+        lang = profile.language
+        next_task = self._get_next_task_description(profile.user_id)
+        next_line = (
+            f"\n\n📌 **مهمتك التالية:** {next_task}" if (next_task and lang == "ar")
+            else (f"\n\n📌 **Your next task:** {next_task}" if next_task else "")
+        )
+        if lang == "ar":
+            prompt = (
+                f"أنت Lumin — مدرب شخصي محترف ومشجع.\n"
+                f"المستخدم {profile.name} أنهى مهمته في {profile.goal}.\n"
+                f"اكتب رسالة تشجيعية قصيرة (جملتان فقط) بالعربية تعترف فيها بإنجازه وتشجعه على الاستمرار."
+            )
+        else:
+            prompt = (
+                f"You are Lumin — a professional, empathetic coach.\n"
+                f"User {profile.name} just completed their task for {profile.goal}.\n"
+                f"Write a brief encouraging message (2 sentences max) acknowledging their achievement."
+            )
+        try:
+            encouragement = call_llm(prompt, max_tokens=100).strip()
+        except Exception:
+            encouragement = "✅ أحسنت!" if lang == "ar" else "✅ Great job!"
+        return f"{encouragement}{next_line}"
+
+    def _get_next_task_description(self, user_id: str) -> str:
+        """Return the description of the next incomplete daily task, or empty string."""
+        try:
+            conn = get_connection()
+            row = conn.execute(
+                "SELECT description FROM daily_tasks WHERE user_id=? AND completed=0 ORDER BY day ASC LIMIT 1",
+                (user_id,),
+            ).fetchone()
+            conn.close()
+            return row["description"] if row else ""
+        except Exception:
+            return ""
+
+    def _llm_daily_response(self, profile: UserProfile, message: str, report) -> str:
+        """v6.9: LLM understands a long user message and responds empathetically with context."""
+        lang = profile.language
+        task_ctx = report.notes if report.notes else ""
+        if lang == "ar":
+            prompt = (
+                f"أنت Lumin — مدرب شخصي.\n"
+                f"المستخدم {profile.name} يتعلم {profile.goal} (المستوى: {profile.level}).\n"
+                f"مهمة اليوم: {task_ctx}\n\n"
+                f"رسالة المستخدم: \"{message}\"\n\n"
+                f"اقرأ رسالته بعناية وأجبه بجملتين: اعترف بما قاله، ثم وجّهه للخطوة التالية."
+            )
+        else:
+            prompt = (
+                f"You are Lumin — a personal coach.\n"
+                f"User {profile.name} is learning {profile.goal} (level: {profile.level}).\n"
+                f"Today's task: {task_ctx}\n\n"
+                f"User's message: \"{message}\"\n\n"
+                f"Read their message carefully and reply in 2 sentences: acknowledge what they said, then guide them to the next step."
+            )
+        try:
+            return call_llm(prompt, max_tokens=150).strip()
+        except Exception:
+            return task_ctx  # fallback to task description
+
+    def _evaluate_user_submission(self, profile: UserProfile, submission: str, exercise_ctx: str) -> str:
+        """v6.9: Evaluate a user's submitted text/exercise and provide specific feedback."""
+        lang = profile.language
+        if lang == "ar":
+            prompt = (
+                f"أنت Lumin — مدرب لغوي ومهاري.\n"
+                f"طلبت من المستخدم {profile.name}: {exercise_ctx}\n"
+                f"إجابة المستخدم: \"{submission}\"\n\n"
+                f"قيّم إجابته في 2-3 جمل: ما الصحيح فيها؟ ما الذي يمكن تحسينه؟ "
+                f"كن محدداً ومشجعاً."
+            )
+        else:
+            prompt = (
+                f"You are Lumin — a skilled coach.\n"
+                f"You asked user {profile.name} to: {exercise_ctx}\n"
+                f"User's submission: \"{submission}\"\n\n"
+                f"Evaluate their answer in 2-3 sentences: what is correct? what can be improved? "
+                f"Be specific and encouraging."
+            )
+        try:
+            return call_llm(prompt, max_tokens=150).strip()
+        except Exception:
+            return "✅ شكراً! سأراجع إجابتك." if lang == "ar" else "✅ Thanks! I've reviewed your answer."
+
+    def _plan_info_reply(self, profile: UserProfile) -> str:
+        """
+        v7.1: Show full plan from DB — zero LLM, zero hallucination.
+        Reads milestones + daily_tasks and formats them as a structured display.
+        """
+        conn = get_connection()
+        lang  = profile.language
+        weeks = profile.estimated_weeks
+
+        # ── Milestones ────────────────────────────────────────────
+        m_rows = conn.execute(
+            "SELECT title, week_start, week_end FROM milestones "
+            "WHERE user_id = ? ORDER BY week_start",
+            (profile.user_id,),
+        ).fetchall()
+
+        # ── Daily tasks (all pending + completed) ─────────────────
+        t_rows = conn.execute(
+            "SELECT day, description, completed FROM daily_tasks "
+            "WHERE user_id = ? ORDER BY day ASC",
+            (profile.user_id,),
+        ).fetchall()
+        conn.close()
+
+        # ── Build header ──────────────────────────────────────────
+        if lang == "ar":
+            header = (
+                f"📋 خطتك الكاملة — {profile.goal}\n"
+                f"⏱️ المدة الإجمالية: {weeks} أسبوع\n"
+            )
+        else:
+            header = (
+                f"📋 Your Full Plan — {profile.goal}\n"
+                f"⏱️ Total duration: {weeks} weeks\n"
+            )
+
+        # ── Milestones section ────────────────────────────────────
+        m_section = ""
+        if m_rows:
+            if lang == "ar":
+                m_section = "\n🏁 المراحل:\n"
+                for r in m_rows:
+                    m_section += f"  • {r[0]} (الأسبوع {r[1]}–{r[2]})\n"
+            else:
+                m_section = "\n🏁 Milestones:\n"
+                for r in m_rows:
+                    m_section += f"  • {r[0]} (week {r[1]}–{r[2]})\n"
+
+        # ── Daily tasks section ───────────────────────────────────
+        t_section = ""
+        if t_rows:
+            if lang == "ar":
+                t_section = "\n📅 المهام اليومية:\n"
+                for r in t_rows:
+                    icon = "✅" if r[2] else "⬜"
+                    t_section += f"  {icon} اليوم {r[0]}: {r[1]}\n"
+            else:
+                t_section = "\n📅 Daily tasks:\n"
+                for r in t_rows:
+                    icon = "✅" if r[2] else "⬜"
+                    t_section += f"  {icon} Day {r[0]}: {r[1]}\n"
+        else:
+            if lang == "ar":
+                t_section = "\n_(لا توجد مهام محفوظة بعد — أكمل إعداد خطتك أولاً.)_\n"
+            else:
+                t_section = "\n_(No tasks saved yet — complete your plan setup first.)_\n"
+
+        return header + m_section + t_section
+
+    def _meta_reply(self, profile: UserProfile) -> str:
+        """Answer meta/source questions — explain KB, don't hallucinate."""
+        lang = profile.language
+        if lang == "ar":
+            prompt = (
+                f"أخبر {profile.name} في جملتين بالعربية أنك تعتمد على قاعدة معرفة محلية متخصصة "
+                f"في مجال {profile.goal}، ولا تتصل بالإنترنت ولا تستخدم مصادر خارجية."
+            )
+        else:
+            prompt = (
+                f"Tell {profile.name} in two sentences that you rely on a curated local knowledge base "
+                f"focused on {profile.goal}. You do not connect to the internet or use external sources."
+            )
+        return call_llm(prompt, max_tokens=80)
+
+    def _greeting_with_task(self, profile: UserProfile) -> str:
+        """
+        Pure greeting received → respond warmly + present today's task naturally.
+        Avoids dumping raw task text. The Sentinel wraps it in a proper check-in.
+        """
+        report = self.coach.daily_task(profile, "")
+        task   = report.notes
+        lang   = profile.language
+        from agents.coach import _sentinel_persona
+        persona = _sentinel_persona(profile)
+        if lang == "ar":
+            prompt = (
+                f"{persona}\n"
+                f"المستخدم {profile.name} أرسل تحية. هدفه: {profile.goal}.\n"
+                f"مهمة اليوم المحددة له: {task}\n"
+                f"رد بجملتين بالعربية: اعترف بالتحية بشكل طبيعي، ثم قدّم مهمة اليوم "
+                f"بأسلوب محفّز ومباشر — لا تنسخ نص المهمة حرفياً."
+            )
+        else:
+            prompt = (
+                f"{persona}\n"
+                f"User {profile.name} sent a greeting. Their goal: {profile.goal}.\n"
+                f"Today's assigned task: {task}\n"
+                f"Reply in two sentences: acknowledge the greeting naturally, "
+                f"then present today's task in a motivating, direct way — don't copy the task verbatim."
+            )
+        return call_llm(prompt, max_tokens=120)
+
+    def _handle_goal_reset(self, profile: UserProfile) -> str:
+        """
+        v5.4 Hot Swap: archive current skill instead of deleting it.
+        Resets active plan data, keeps identity & archived history.
+        Called when user asks to change their skill/goal entirely.
+        """
+        self._archive_and_reset(profile)
+        lang = profile.language
+        name = profile.name
+        if lang == "ar":
+            prompt = (
+                f"المستخدم {name} أراد تغيير مهارته. تم أرشفة مهارته السابقة ({profile.goal}) "
+                f"ويمكنه العودة إليها لاحقاً.\n"
+                f"اكتب رسالة قصيرة (جملتان) بالعربية تشجّعه على البدء من جديد "
+                f"وتطلب منه إخبارك بمهارته الجديدة ومستواه ووقته اليومي."
+            )
+        else:
+            prompt = (
+                f"User {name} wants to change their skill. Their previous skill ({profile.goal}) "
+                f"has been archived and can be resumed later.\n"
+                f"Write 2 sentences in English encouraging them to start fresh "
+                f"and ask for their new skill, level, and daily time."
+            )
+        return call_llm(prompt, max_tokens=120)
+
+    def _archive_and_reset(self, profile) -> None:
+        """v5.4 Hot Swap: archive current skill, reset user to onboarding."""
+        uid = profile.user_id
+        conn = get_connection()
+        conn.execute("PRAGMA journal_mode=WAL")
+
+        rows = conn.execute(
+            "SELECT completed FROM milestones WHERE user_id = ?", (uid,)
+        ).fetchall()
+        total_m   = len(rows)
+        reached_m = sum(1 for r in rows if r[0])
+        rate      = round(reached_m / total_m, 2) if total_m else 0.0
+
+        snapshot_text = (
+            "skill=" + str(profile.goal) + " | level=" + str(profile.level) +
+            " | milestones=" + str(reached_m) + "/" + str(total_m) +
+            " | rate=" + str(int(rate * 100)) + "%"
+        )
+
+        conn.execute(
+            "INSERT INTO archived_skills "
+            "(user_id, goal, category, level, milestone_reached, total_milestones, success_rate, snapshot_text) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (uid, profile.goal, profile.category, profile.level,
+             reached_m, total_m, rate, snapshot_text),
+        )
+
+        for table in ("milestones", "daily_tasks", "tasks", "snapshots",
+                      "failure_log", "context_frames"):
+            try:
+                conn.execute("DELETE FROM " + table + " WHERE user_id = ?", (uid,))
+            except Exception:
+                pass
+
+        conn.execute(
+            "UPDATE users SET goal='', category='academic', level='beginner', "
+            "estimated_weeks=0, onboarding_complete=0, "
+            "onboarding_step='awaiting_goal', partial_profile=NULL "
+            "WHERE user_id=?",
+            (uid,),
+        )
+        conn.commit()
+        conn.close()
+        log_agent(uid, "orchestrator", "skill_archived",
+                  "archived " + str(profile.goal) + " -> onboarding reset",
+                  route="goal_reset", tokens_est=0)
+
+    def _check_resurrection(self, user_id: str, new_goal: str):
+        """v5.4: Return ArchivedSkill if new_goal matches a previously archived skill."""
+        conn = get_connection()
+        rows = conn.execute(
+            "SELECT * FROM archived_skills WHERE user_id = ? ORDER BY archived_at DESC",
+            (user_id,),
+        ).fetchall()
+        conn.close()
+        goal_lower = new_goal.lower().strip()
+        goal_words = {w for w in goal_lower.split() if len(w) > 3}
+        for row in rows:
+            arch_lower = row["goal"].lower()
+            arch_words = {w for w in arch_lower.split() if len(w) > 3}
+            # full substring match OR shared significant word
+            if (goal_lower in arch_lower or arch_lower in goal_lower
+                    or bool(goal_words & arch_words)):
+                return ArchivedSkill(**dict(row))
+        return None
+
+    # ==========================================================
+    # ASYNC DB HELPERS
+    # ==========================================================
+
+    async def _create_partial_user(self, user_id: str, language: str) -> None:
+        async with aiosqlite.connect(str(_db_module.DB_PATH)) as conn:
+            await conn.execute("PRAGMA journal_mode=WAL")
+            await conn.execute(
+                "INSERT OR IGNORE INTO users "
+                "(user_id, name, goal, category, level, "
+                " hours_per_day, days_per_week, estimated_weeks, "
+                " start_date, language, onboarding_complete, onboarding_step) "
+                "VALUES (?, '', '', 'academic', 'beginner', "
+                "        1.0, 5, 0, ?, ?, 0, 'awaiting_goal')",
+                (user_id, str(__import__('datetime').date.today()), language))
+            await conn.commit()
+
+    async def _update_partial_profile(self, user_id: str, partial: dict, new_step: str) -> None:
+        async with aiosqlite.connect(str(_db_module.DB_PATH)) as conn:
+            await conn.execute("PRAGMA journal_mode=WAL")
+            await conn.execute(
+                "UPDATE users SET partial_profile=?, onboarding_step=?, goal=?, category=? "
+                "WHERE user_id=?",
+                (
+                    __import__('json').dumps(partial, ensure_ascii=False),
+                    new_step,
+                    partial.get("goal", ""),
+                    partial.get("category", "academic"),
+                    user_id,
+                ))
+            await conn.commit()
+
+    async def _mark_onboarding_complete(self, user_id: str) -> None:
+        async with aiosqlite.connect(str(_db_module.DB_PATH)) as conn:
+            await conn.execute("PRAGMA journal_mode=WAL")
+            await conn.execute(
+                "UPDATE users SET onboarding_complete=1, onboarding_step='complete' WHERE user_id=?",
+                (user_id,))
+            await conn.commit()
+
+    async def _update_language(self, user_id: str, language: str) -> None:
+        async with aiosqlite.connect(str(_db_module.DB_PATH)) as conn:
+            await conn.execute("PRAGMA journal_mode=WAL")
+            await conn.execute(
+                "UPDATE users SET language=? WHERE user_id=?", (language, user_id))
+            await conn.commit()
+
+    async def _get_profile_async(self, user_id: str):
+        async with aiosqlite.connect(str(_db_module.DB_PATH)) as conn:
+            conn.row_factory = aiosqlite.Row
+            async with conn.execute(
+                "SELECT * FROM users WHERE user_id=?", (user_id,)
+            ) as cur:
+                row = await cur.fetchone()
+        from models.schemas import UserProfile
+        return UserProfile(**dict(row)) if row else None
+
+    async def _check_date_gap(self, user_id: str) -> int:
+        async with aiosqlite.connect(str(_db_module.DB_PATH)) as conn:
+            async with conn.execute(
+                "SELECT MAX(date) FROM tasks WHERE user_id=?", (user_id,)
+            ) as cur:
+                row = await cur.fetchone()
+        if not row or not row[0]:
+            return 0
+        try:
+            from datetime import datetime, date
+            last = datetime.strptime(row[0], "%Y-%m-%d").date()
+            return max(0, (date.today() - last).days)
+        except Exception:
+            return 0
+
+    # ==========================================================
+    # STAGE-GATE — Sequential delivery lock per week/stage
+    # ==========================================================
+
+    def _check_stage_gate(self, user_id: str) -> dict:
+        """
+        Returns the current stage status for this user.
+        Stage = current week. Gate = active if any task in the current
+        week is incomplete.
+
+        Returns: {
+            'current_week': int,
+            'incomplete': int,   # incomplete tasks in current week
+            'total':      int,   # total tasks in current week
+            'locked':     bool,
+        }
+        """
+        try:
+            conn = get_connection()
+            # Determine the user's current week from first incomplete task
+            row = conn.execute(
+                "SELECT week FROM daily_tasks "
+                "WHERE user_id=? AND completed=0 ORDER BY day ASC LIMIT 1",
+                (user_id,),
+            ).fetchone()
+            if not row:
+                conn.close()
+                return {"current_week": 0, "incomplete": 0, "total": 0, "locked": False}
+
+            current_week = row["week"]
+            total = conn.execute(
+                "SELECT COUNT(*) FROM daily_tasks WHERE user_id=? AND week=?",
+                (user_id, current_week),
+            ).fetchone()[0]
+            incomplete = conn.execute(
+                "SELECT COUNT(*) FROM daily_tasks WHERE user_id=? AND week=? AND completed=0",
+                (user_id, current_week),
+            ).fetchone()[0]
+            conn.close()
+            return {
+                "current_week": current_week,
+                "incomplete":   incomplete,
+                "total":        total,
+                "locked":       incomplete > 0,
+            }
+        except Exception:
+            return {"current_week": 0, "incomplete": 0, "total": 0, "locked": False}
+
+    # ==========================================================
+    # BEHAVIORAL PULSE — Proactive Fixer trigger (event-driven)
+    # ==========================================================
+
+    def _count_interactions_since_onboarding(self, user_id: str) -> int:
+        """
+        v6.6 — Counts route_decision entries in agent_log AFTER the most recent
+        profile_complete or hard_reset. Returns 0 if onboarding hasn't happened yet.
+        Used to suppress background discourse and behavioral pulse for first 3
+        interactions of a fresh skill.
+        """
+        try:
+            conn = get_connection()
+            anchor = conn.execute(
+                "SELECT id FROM agent_log "
+                "WHERE user_id=? AND action IN ('profile_complete', 'hard_reset') "
+                "ORDER BY id DESC LIMIT 1",
+                (user_id,),
+            ).fetchone()
+            min_id = anchor["id"] if anchor else 0
+            count  = conn.execute(
+                "SELECT COUNT(*) FROM agent_log "
+                "WHERE user_id=? AND action='route_decision' AND id > ?",
+                (user_id, min_id),
+            ).fetchone()[0]
+            conn.close()
+            return int(count)
+        except Exception:
+            return 999  # fail-open: don't suppress if check errors
+
+    def _check_behavioral_pulse(self, user_id: str) -> int:
+        """
+        Reads agent_log timestamps to detect two behavioral signals:
+          1. Long inactivity gap: > 12 hours between last two interactions
+          2. Repeated query: same topic asked 2+ times in last 3 fetch entries
+
+        Returns behavioral_score (0-2). Score >= 2 triggers Fixer.
+        Event-driven: fires on the next user message, no background scheduler.
+
+        v6.4 Reset Guard: ignores ALL log entries before the most recent
+        hard_reset or profile_complete event. Prevents false positives
+        when a user just completed /reset and starts fresh onboarding.
+        """
+        try:
+            conn = get_connection()
+
+            # Reset Guard: find the minimum log ID to consider.
+            # Any signal from before a hard_reset or a fresh onboarding is stale.
+            min_id = 0
+            reset_row = conn.execute(
+                "SELECT id, ts FROM agent_log "
+                "WHERE user_id=? AND action IN ('hard_reset', 'profile_complete', 'goal_reset') "
+                "ORDER BY id DESC LIMIT 1",
+                (user_id,),
+            ).fetchone()
+            if reset_row:
+                min_id = reset_row["id"]
+                # If the most recent reset/onboarding was within the last 24 hours,
+                # suppress behavioral pulse entirely — user is starting fresh.
+                try:
+                    reset_ts = datetime.fromisoformat(reset_row["ts"])
+                    if (datetime.now() - reset_ts).total_seconds() < 86400:
+                        conn.close()
+                        return 0
+                except Exception:
+                    pass
+
+            # Last 5 log entries AFTER the most recent reset
+            recent = conn.execute(
+                "SELECT ts, action, detail FROM agent_log "
+                "WHERE user_id=? AND id > ? ORDER BY id DESC LIMIT 5",
+                (user_id, min_id),
+            ).fetchall()
+
+            # Last 3 fetch entries AFTER the most recent reset
+            fetches = conn.execute(
+                "SELECT detail FROM agent_log "
+                "WHERE user_id=? AND action='fetch' AND id > ? ORDER BY id DESC LIMIT 3",
+                (user_id, min_id),
+            ).fetchall()
+            conn.close()
+
+            score = 0
+
+            # Signal 1: long inactivity gap (> 12 hours)
+            if len(recent) >= 2:
+                try:
+                    t_last = datetime.fromisoformat(recent[0]["ts"])
+                    t_prev = datetime.fromisoformat(recent[1]["ts"])
+                    gap_h  = (t_last - t_prev).total_seconds() / 3600
+                    if gap_h > 12:
+                        score += 1
+                except Exception:
+                    pass
+
+            # Signal 2: repeated queries (same first 30 chars in last 3 fetches)
+            if len(fetches) >= 2:
+                keys = [
+                    (r["detail"] or "")[:30].lower().strip()
+                    for r in fetches
+                ]
+                if len(keys) != len(set(keys)):
+                    score += 1
+
+            return score
+        except Exception:
+            return 0
+
+    # ==========================================================
+    # MILESTONE VERDICT — Consensus Engine at milestone boundary
+    # ==========================================================
+
+    def _check_milestone_complete(self, user_id: str) -> Optional[dict]:
+        """
+        Returns the first un-completed milestone where ALL its daily_tasks
+        are now done.  Returns None if no milestone just crossed the boundary.
+        Sync — safe to call in executor.
+        """
+        try:
+            conn = get_connection()
+            milestones = conn.execute(
+                "SELECT id, title, week_start, week_end, completed "
+                "FROM milestones WHERE user_id = ? AND completed = 0 "
+                "ORDER BY week_start",
+                (user_id,),
+            ).fetchall()
+
+            for m in milestones:
+                total = conn.execute(
+                    "SELECT COUNT(*) FROM daily_tasks "
+                    "WHERE user_id = ? AND week >= ? AND week <= ?",
+                    (user_id, m["week_start"], m["week_end"]),
+                ).fetchone()[0]
+                incomplete = conn.execute(
+                    "SELECT COUNT(*) FROM daily_tasks "
+                    "WHERE user_id = ? AND week >= ? AND week <= ? AND completed = 0",
+                    (user_id, m["week_start"], m["week_end"]),
+                ).fetchone()[0]
+
+                if total > 0 and incomplete == 0:
+                    conn.close()
+                    return dict(m)
+
+            conn.close()
+        except Exception:
+            pass
+        return None
+
+    async def _milestone_verdict(
+        self, profile: UserProfile, milestone: dict
+    ) -> str:
+        """
+        Runs Coach vs Fixer Consensus at the milestone boundary.
+        Logs three entries to agent_log (visible in Dashboard Consensus tab).
+        Marks the milestone as completed in DB.
+        Returns a user-facing message only on 'rebuild' action; empty string otherwise.
+        Never crashes — all errors are swallowed + logged.
+        """
+        try:
+            uid  = profile.user_id
+            conn = get_connection()
+
+            total = conn.execute(
+                "SELECT COUNT(*) FROM daily_tasks "
+                "WHERE user_id=? AND week>=? AND week<=?",
+                (uid, milestone["week_start"], milestone["week_end"]),
+            ).fetchone()[0]
+            done = conn.execute(
+                "SELECT COUNT(*) FROM daily_tasks "
+                "WHERE user_id=? AND week>=? AND week<=? AND completed=1",
+                (uid, milestone["week_start"], milestone["week_end"]),
+            ).fetchone()[0]
+
+            failure_rows = conn.execute(
+                "SELECT failure_streak, gap_days FROM failure_log "
+                "WHERE user_id=? ORDER BY id DESC LIMIT 15",
+                (uid,),
+            ).fetchall()
+            gap_count = conn.execute(
+                "SELECT COUNT(*) FROM agent_log "
+                "WHERE user_id=? AND action='semantic_gap'",
+                (uid,),
+            ).fetchone()[0]
+            conn.close()
+
+            completion_rate = round(done / total, 2) if total else 1.0
+            max_streak      = max((r[0] for r in failure_rows), default=0)
+            avg_gap         = (
+                round(sum(r[1] for r in failure_rows) / len(failure_rows), 1)
+                if failure_rows else 0
+            )
+
+            context = (
+                f"milestone='{milestone['title']}' boundary reached | "
+                f"completion_rate={completion_rate:.0%} | "
+                f"max_streak={max_streak} | avg_gap={avg_gap}d | "
+                f"semantic_gaps={gap_count}"
+            )
+
+            log_agent(uid, "orchestrator", "milestone_verdict_start",
+                      f"milestone='{milestone['title']}' -> Consensus Verdict",
+                      route="milestone_verdict", tokens_est=0)
+
+            result = await run_consensus(profile, "milestone_verdict", context)
+
+            log_agent(uid, "orchestrator", "milestone_verdict_result",
+                      f"action={result.action} | {result.decision[:120]}",
+                      route="milestone_verdict", tokens_est=0)
+
+            # Mark milestone complete in DB
+            conn2 = get_connection()
+            conn2.execute(
+                "UPDATE milestones SET completed=1 WHERE id=?", (milestone["id"],)
+            )
+            conn2.commit()
+            conn2.close()
+
+            log_agent(uid, "orchestrator", "milestone_verdict_done",
+                      f"action={result.action} milestone='{milestone['title']}' marked complete",
+                      route="milestone_verdict", tokens_est=0)
+
+            if result.action == "rebuild":
+                loop = asyncio.get_event_loop()
+                rebuild_msg = await loop.run_in_executor(None, self.planner.rebuild, profile)
+                lang   = profile.language
+                prefix = (
+                    f"أكملت مرحلة '{milestone['title']}' — لكن الـ Verdict يقترح إعادة بناء الخطة.\n"
+                    if lang == "ar" else
+                    f"Milestone '{milestone['title']}' complete — Verdict recommends rebuilding your plan.\n"
+                )
+                return f"\n\n{prefix}{rebuild_msg}"
+
+        except Exception as e:
+            log_agent(
+                profile.user_id, "orchestrator", "milestone_verdict_error",
+                str(e)[:200], route="milestone_verdict",
+            )
+        return ""
+
+    # ==========================================================
+    # BACKGROUND DISCOURSE — Sovereign Agent Loop
+    # ==========================================================
+
+    async def background_discourse(
+        self,
+        user_id: str,
+        chat_id: int,
+        bot,
+    ) -> None:
+        """
+        Fire-and-forget background coroutine scheduled via asyncio.create_task
+        AFTER the user already received their reply.
+        DEMO_MODE: skips entirely. Never raises.
+        v6.4: strict separation — no internal terms reach the user.
+        v7.3: session-start guard — suppress on first msg of a new session (>60 min gap).
+        v7.4: eval_complete guard — suppress after exercise evaluation.
+        """
+        if DEMO_MODE:
+            return
+
+        try:
+            profile = self._get_profile(user_id)
+            if not profile or not profile.onboarding_complete:
+                return
+
+            # v6.6: 3-interaction guard — no proactive discourse on fresh skill
+            _interactions = self._count_interactions_since_onboarding(user_id)
+            if _interactions < 3:
+                log_agent(user_id, "orchestrator", "background_discourse_suppressed",
+                          f"fresh skill ({_interactions}/3 interactions) — discourse suppressed",
+                          route="background_discourse", tokens_est=0)
+                return
+
+            # v7.3: Session-start guard — suppress on first message of a new session
+            # (returning user who just came back after a long gap: don't bombard them)
+            try:
+                _sess_conn = get_connection()
+                _sess_rows = _sess_conn.execute(
+                    "SELECT ts FROM agent_log "
+                    "WHERE user_id=? AND action='route_decision' "
+                    "ORDER BY id DESC LIMIT 2",
+                    (user_id,),
+                ).fetchall()
+                _sess_conn.close()
+                if len(_sess_rows) >= 2:
+                    _t_latest = datetime.fromisoformat(_sess_rows[0]["ts"])
+                    _t_prev   = datetime.fromisoformat(_sess_rows[1]["ts"])
+                    _gap_mins = (_t_latest - _t_prev).total_seconds() / 60
+                    if _gap_mins > 60:  # first message after 1h+ gap → suppress
+                        log_agent(user_id, "orchestrator", "background_discourse_suppressed",
+                                  f"session-start suppression (gap={_gap_mins:.0f}min) — returning user",
+                                  route="background_discourse", tokens_est=0)
+                        return
+                elif len(_sess_rows) == 1:
+                    # Only one interaction ever → definitely suppress
+                    return
+            except Exception:
+                pass
+
+            # v7.4: eval_complete guard — suppress immediately after exercise evaluation
+            try:
+                _ec_conn = get_connection()
+                _eval_row = _ec_conn.execute(
+                    "SELECT id FROM agent_log WHERE user_id=? AND action='eval_complete' "
+                    "ORDER BY id DESC LIMIT 1", (user_id,)
+                ).fetchone()
+                _latest_route = _ec_conn.execute(
+                    "SELECT id FROM agent_log WHERE user_id=? AND action='route_decision' "
+                    "ORDER BY id DESC LIMIT 1", (user_id,)
+                ).fetchone()
+                _ec_conn.close()
+                if _eval_row and _latest_route and _eval_row["id"] > _latest_route["id"]:
+                    log_agent(user_id, "orchestrator", "background_discourse_suppressed",
+                              "eval_complete guard — exercise just evaluated",
+                              route="background_discourse", tokens_est=0)
+                    return
+            except Exception:
+                pass
+
+            # Cooldown safety guard: max one outbound per 5 minutes
+            try:
+                _cd_conn = get_connection()
+                _cd_row  = _cd_conn.execute(
+                    "SELECT ts FROM agent_log "
+                    "WHERE user_id=? AND action='background_discourse_sent' "
+                    "ORDER BY id DESC LIMIT 1",
+                    (user_id,),
+                ).fetchone()
+                _cd_conn.close()
+                if _cd_row:
+                    _last_ts = datetime.fromisoformat(_cd_row["ts"])
+                    if (datetime.now() - _last_ts).total_seconds() < 300:
+                        log_agent(user_id, "orchestrator", "background_discourse_cooldown",
+                                  "cooldown active (<5 min since last outbound) -> skipped",
+                                  route="background_discourse", tokens_est=0)
+                        return
+            except Exception:
+                pass
+
+            loop = asyncio.get_event_loop()
+
+            b_score, stage, streak, (current_task, last_query) = await asyncio.gather(
+                loop.run_in_executor(None, self._check_behavioral_pulse, user_id),
+                loop.run_in_executor(None, self._check_stage_gate, user_id),
+                loop.run_in_executor(None, self.coach._get_streak, user_id),
+                loop.run_in_executor(None, self._get_discourse_context, user_id),
+            )
+
+            log_agent(user_id, "orchestrator", "background_discourse_start",
+                      f"b_score={b_score} locked={stage['locked']} "
+                      f"streak={streak} task='{current_task[:60]}'",
+                      route="background_discourse", tokens_est=0)
+
+            context = (
+                f"deep_trajectory_analysis | "
+                f"goal='{profile.goal}' level={profile.level} | "
+                f"current_task='{current_task[:120]}' | "
+                f"last_query='{last_query[:80]}' | "
+                f"behavioral_score={b_score}/2 | "
+                f"stage_week={stage['current_week']} "
+                f"incomplete={stage['incomplete']}/{stage['total']} | "
+                f"failure_streak={streak}"
+            )
+
+            consensus = await run_consensus(profile, "background_discourse", context)
+
+            log_agent(user_id, "orchestrator", "background_discourse_verdict",
+                      f"action={consensus.action} | {consensus.decision[:120]}",
+                      route="background_discourse", tokens_est=0)
+
+            send = consensus.action != "proceed" or b_score > 0 or streak > 0
+            if not send:
+                log_agent(user_id, "orchestrator", "background_discourse_clear",
+                          "action=proceed + zero signals -> no interrupt",
+                          route="background_discourse", tokens_est=0)
+                return
+
+            # v6.4: Clean user-facing prompt — zero internal system terms
+            lang = profile.language
+            if lang == "ar":
+                tone = (
+                    "تحدٍّ تكتيكي إضافي" if consensus.action == "proceed_adjusted"
+                    else "تدخل استراتيجي"
+                )
+                prompt = (
+                    f"أنت مدرب تعليمي متقدم في Lumin — ردودك مخصصة ومباشرة.\n\n"
+                    f"الاسم: {profile.name} | الهدف: {profile.goal} | المستوى: {profile.level}\n"
+                    f"المهمة النشطة: {current_task}\n"
+                    f"آخر سؤال: {last_query}\n\n"
+                    f"اكتب رسالة {tone} (3 جمل فقط) بالعربية تُشير مباشرةً إلى المهمة والسؤال. "
+                    f"اقترح خطوة تكتيكية محددة قابلة للتنفيذ الآن.\n"
+                    f"قاعدة صارمة: لا تذكر Coach, Fixer, consensus, streak, stage-gate, agent_log, "
+                    f"LuminAgents، أو أي مصطلح تقني داخلي. تحدث مع المستخدم مباشرة فقط."
+                )
+            else:
+                tone = (
+                    "tactical optimization challenge" if consensus.action == "proceed_adjusted"
+                    else "strategic coaching check-in"
+                )
+                prompt = (
+                    f"You are an advanced learning coach at Lumin — "
+                    f"sharp, specific, zero filler.\n\n"
+                    f"Name: {profile.name} | Goal: {profile.goal} | Level: {profile.level}\n"
+                    f"Active task: {current_task}\n"
+                    f"Last query: {last_query}\n\n"
+                    f"Write a {tone} message (3 sentences only) that directly references "
+                    f"the active task and last query. Propose one immediately actionable step.\n"
+                    f"Hard rule: never mention Coach, Fixer, consensus, streak, stage-gate, "
+                    f"agent_log, LuminAgents, or any internal system term. "
+                    f"Speak directly to the user only."
+                )
+
+            outbound = await loop.run_in_executor(
+                None, lambda: call_llm(prompt, max_tokens=2048, thinking_budget=0)
+            )
+
+            action_icon = {"rebuild": "🚨", "simplify": "⚡", "proceed_adjusted": "🎯"}.get(
+                consensus.action, "🔔"
+            )
+            label = action_icon + " " + (
+                "تقييم استراتيجي" if lang == "ar" else "Strategic Assessment"
+            )
+            await bot.send_message(chat_id=chat_id, text=f"{label}\n\n{outbound}")
+
+            log_agent(user_id, "orchestrator", "background_discourse_sent",
+                      f"action={consensus.action} b_score={b_score} -> chat_id={chat_id}",
+                      route="background_discourse", tokens_est=150)
+
+        except Exception as e:
+            try:
+                log_agent(user_id, "orchestrator", "background_discourse_error",
+                          str(e)[:200], route="background_discourse")
+            except Exception:
+                pass
+
+    def _get_discourse_context(self, user_id: str) -> tuple:
+        try:
+            conn = get_connection()
+            task_row = conn.execute(
+                "SELECT description FROM daily_tasks "
+                "WHERE user_id=? AND completed=0 ORDER BY day ASC LIMIT 1",
+                (user_id,),
+            ).fetchone()
+            query_row = conn.execute(
+                "SELECT details FROM agent_log "
+                "WHERE user_id=? AND action='route_decision' "
+                "ORDER BY id DESC LIMIT 1",
+                (user_id,),
+            ).fetchone()
+            conn.close()
+            current_task = task_row["description"] if task_row else "No active task"
+            last_query   = query_row["details"]    if query_row else ""
+            return current_task, last_query
+        except Exception:
+            return "No active Task", ""
+
+    def _CLEANUP_MARKER(self): pass
+
+            # v7.3: Session-start guard — suppress on first message of a new session
+            # (returning user who just came back after a long gap: don't bombard them)
+            try:
+                _sess_conn = get_connection()
+                _sess_rows = _sess_conn.execute(
+                    "SELECT ts FROM agent_log "
+                    "WHERE user_id=? AND action='route_decision' "
+                    "ORDER BY id DESC LIMIT 2",
+                    (user_id,),
+                ).fetchall()
+                _sess_conn.close()
+                if len(_sess_rows) >= 2:
+                    _t_latest = datetime.fromisoformat(_sess_rows[0]["ts"])
+                    _t_prev   = datetime.fromisoformat(_sess_rows[1]["ts"])
+                    _gap_mins = (_t_latest - _t_prev).total_seconds() / 60
+                    if _gap_mins > 60:  # first message after 1h+ gap → suppress
+                        log_agent(user_id, "orchestrator", "background_discourse_suppressed",
+                                  f"session-start suppression (gap={_gap_mins:.0f}min) — returning user",
+                                  route="background_discourse", tokens_est=0)
+                        return
+                elif len(_sess_rows) == 1:
+                    # Only one interaction ever → definitely suppress
+                    return
+            except Exception:
+                pass
+
+            # Cooldown safety guard: max one outbound per 5 minutes
+            try:
+                _cd_conn = get_connection()
+                _cd_row  = _cd_conn.execute(
+                    "SELECT ts FROM agent_log "
+                    "WHERE user_id=? AND action='background_discourse_sent' "
+                    "ORDER BY id DESC LIMIT 1",
+                    (user_id,),
+                ).fetchone()
+                _cd_conn.close()
+                if _cd_row:
+                    _last_ts = datetime.fromisoformat(_cd_row["ts"])
+                    if (datetime.now() - _last_ts).total_seconds() < 300:
+                        log_agent(user_id, "orchestrator", "background_discourse_cooldown",
+                                  "cooldown active (<5 min since last outbound) -> skipped",
+                                  route="background_discourse", tokens_est=0)
+                        return
+            except Exception:
+                pass
+
+            loop = asyncio.get_event_loop()
+
+            b_score, stage, streak, (current_task, last_query) = await asyncio.gather(
+                loop.run_in_executor(None, self._check_behavioral_pulse, user_id),
+                loop.run_in_executor(None, self._check_stage_gate, user_id),
+                loop.run_in_executor(None, self.coach._get_streak, user_id),
+                loop.run_in_executor(None, self._get_discourse_context, user_id),
+            )
+
+            log_agent(user_id, "orchestrator", "background_discourse_start",
+                      f"b_score={b_score} locked={stage['locked']} "
+                      f"streak={streak} task='{current_task[:60]}'",
+                      route="background_discourse", tokens_est=0)
+
+            context = (
+                f"deep_trajectory_analysis | "
+                f"goal='{profile.goal}' level={profile.level} | "
+                f"current_task='{current_task[:120]}' | "
+                f"last_query='{last_query[:80]}' | "
+                f"behavioral_score={b_score}/2 | "
+                f"stage_week={stage['current_week']} "
+                f"incomplete={stage['incomplete']}/{stage['total']} | "
+                f"failure_streak={streak}"
+            )
+
+            consensus = await run_consensus(profile, "background_discourse", context)
+
+            log_agent(user_id, "orchestrator", "background_discourse_verdict",
+                      f"action={consensus.action} | {consensus.decision[:120]}",
+                      route="background_discourse", tokens_est=0)
+
+            send = consensus.action != "proceed" or b_score > 0 or streak > 0
+            if not send:
+                log_agent(user_id, "orchestrator", "background_discourse_clear",
+                          "action=proceed + zero signals -> no interrupt",
+                          route="background_discourse", tokens_est=0)
+                return
+
+            # v6.4: Clean user-facing prompt — zero internal system terms
+            lang = profile.language
+            if lang == "ar":
+                tone = (
+                    "تحدٍّ تكتيكي إضافي" if consensus.action == "proceed_adjusted"
+                    else "تدخل استراتيجي"
+                )
+                prompt = (
+                    f"أنت مدرب تعليمي متقدم في Lumin — ردودك مخصصة ومباشرة.\n\n"
+                    f"الاسم: {profile.name} | الهدف: {profile.goal} | المستوى: {profile.level}\n"
+                    f"المهمة النشطة: {current_task}\n"
+                    f"آخر سؤال: {last_query}\n\n"
+                    f"اكتب رسالة {tone} (3 جمل فقط) بالعربية تُشير مباشرةً إلى المهمة والسؤال. "
+                    f"اقترح خطوة تكتيكية محددة قابلة للتنفيذ الآن.\n"
+                    f"قاعدة صارمة: لا تذكر Coach, Fixer, consensus, streak, stage-gate, agent_log, "
+                    f"LuminAgents، أو أي مصطلح تقني داخلي. تحدث مع المستخدم مباشرة فقط."
+                )
+            else:
+                tone = (
+                    "tactical optimization challenge" if consensus.action == "proceed_adjusted"
+                    else "strategic coaching check-in"
+                )
+                prompt = (
+                    f"You are an advanced learning coach at Lumin — "
+                    f"sharp, specific, zero filler.\n\n"
+                    f"Name: {profile.name} | Goal: {profile.goal} | Level: {profile.level}\n"
+                    f"Active task: {current_task}\n"
+                    f"Last query: {last_query}\n\n"
+                    f"Write a {tone} message (3 sentences only) that directly references "
+                    f"the active task and last query. Propose one immediately actionable step.\n"
+                    f"Hard rule: never mention Coach, Fixer, consensus, streak, stage-gate, "
+                    f"agent_log, LuminAgents, or any internal system term. "
+                    f"Speak directly to the user only."
+                )
+
+            outbound = await loop.run_in_executor(
+                None, lambda: call_llm(prompt, max_tokens=2048, thinking_budget=0)
+            )
+
+            action_icon = {"rebuild": "🚨", "simplify": "⚡", "proceed_adjusted": "🎯"}.get(
+                consensus.action, "🔔"
+            )
+            label = action_icon + " " + (
+                "تقييم استراتيجي" if lang == "ar" else "Strategic Assessment"
+            )
+            await bot.send_message(chat_id=chat_id, text=f"{label}\n\n{outbound}")
+
+            log_agent(user_id, "orchestrator", "background_discourse_sent",
+                      f"action={consensus.action} b_score={b_score} -> chat_id={chat_id}",
+                      route="background_discourse", tokens_est=150)
+
+        except Exception as e:
+            try:
+                log_agent(user_id, "orchestrator", "background_discourse_error",
+                          str(e)[:200], route="background_discourse")
+            except Exception:
+                pass
+
+    def _get_discourse_context(self, user_id: str) -> tuple:
+        try:
+            conn = get_connection()
+            task_row = conn.execute(
+                "SELECT description FROM daily_tasks "
+                "WHERE user_id=? AND completed=0 ORDER BY day ASC LIMIT 1",
+                (user_id,),
+            ).fetchone()
+            current_task = task_row["description"] if task_row else "general study session"
+            query_row = conn.execute(
+                "SELECT detail FROM agent_log "
+                "WHERE user_id=? AND action='fetch' ORDER BY id DESC LIMIT 1",
+                (user_id,),
+            ).fetchone()
+            last_query = query_row["detail"] if query_row else "no recent content queries"
+            conn.close()
+            return current_task, last_query
+        except Exception:
+            return "general study session", "no recent content queries"
+
+    def _hard_reset_user(self, user_id: str) -> None:
+        conn = get_connection()
+        conn.execute("PRAGMA journal_mode=WAL")
+        _all_tables = (
+            "milestones", "daily_tasks", "tasks", "snapshots",
+            "failure_log", "context_frames", "sources",
+            "archived_skills", "agent_log", "security_audit",
+        )
+        for table in _all_tables:
+            try:
+                conn.execute(f"DELETE FROM {table} WHERE user_id=?", (user_id,))
+            except Exception:
+                pass
+        try:
+            conn.execute(
+                "UPDATE users SET goal=\'\', category=\'academic\', level=\'beginner\', "
+                "estimated_weeks=0, onboarding_complete=0, "
+                "onboarding_step=\'awaiting_goal\', partial_profile=NULL, "
+                "agent_name=\'Lumin\', agent_vibe=\'Professional\' "
+                "WHERE user_id=?",
+                (user_id,),
+            )
+        except Exception:
+            pass
+        conn.commit()
+        conn.close()
+        log_agent(user_id, "orchestrator", "hard_reset",
+                  "/reset — zero-knowledge wipe complete",
+                  route="reset", tokens_est=0)
+
+    async def _handle_identity_change(self, profile, message: str):
+        new_name = None
+        new_vibe = None
+        m_name = _IDENTITY_NAME_RE.search(message)
+        if m_name:
+            new_name = (m_name.group(1) or m_name.group(2) or "").strip().strip("\"'.,")
+        m_vibe = _IDENTITY_VIBE_RE.search(message)
+        if m_vibe:
+            raw_vibe = (m_vibe.group(1) or m_vibe.group(2) or "").strip().lower()
+            new_vibe = _AR_VIBE_MAP.get(raw_vibe, raw_vibe)
+        if not new_name and not new_vibe:
+            return None
+        applied_name = new_name or getattr(profile, 'agent_name', 'Lumin')
+        applied_vibe = new_vibe or getattr(profile, 'agent_vibe', 'motivational')
+        await self._update_agent_identity(profile.user_id, applied_name, applied_vibe)
+        log_agent(profile.user_id, "orchestrator", "identity_change",
+                  "name=" + applied_name + ", vibe=" + applied_vibe,
+                  route="identity", tokens_est=60)
+        if DEMO_MODE:
+            return f"Got it! I'll be {applied_name} from now on."
+        lang = profile.language
+        if lang == "ar":
+            prompt = (
+                f"المستخدم طلب تغيير اسمك إلى '{applied_name}' "
+                f"بأسلوب '{applied_vibe}'. "
+                f"رد بجملة واحدة بالعربية تؤكد فيها هذا التغيير."
+            )
+        else:
+            prompt = (
+                f"The user asked you to go by '{applied_name}' "
+                f"with a '{applied_vibe}' style. "
+                f"Reply in one sentence confirming this change."
+            )
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, lambda: call_llm(prompt, max_tokens=60))
+
+    async def _update_agent_identity(self, user_id: str, name: str, vibe: str) -> None:
+        async with aiosqlite.connect(str(_db_module.DB_PATH)) as conn:
+            await conn.execute("PRAGMA journal_mode=WAL")
+            await conn.execute(
+                "UPDATE users SET agent_name=?, agent_vibe=? WHERE user_id=?",
+                (name, vibe, user_id),
+            )
+            await conn.commit()

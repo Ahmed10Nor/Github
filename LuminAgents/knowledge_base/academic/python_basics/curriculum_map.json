@@ -1,0 +1,51 @@
+{
+  "skill": "python_basics",
+  "category": "academic",
+  "template": "linear_mastery",
+  "total_hours_std": 30.0,
+  "lessons": [
+    {
+      "id": "setup_and_intro",
+      "title": "تثبيت Python وأول برنامج",
+      "weight": 0.1333,
+      "depends_on": [],
+      "hours_std": 4.0
+    },
+    {
+      "id": "variables_and_types",
+      "title": "المتغيرات والأنواع (int, str, float)",
+      "weight": 0.2,
+      "depends_on": [
+        "setup_and_intro"
+      ],
+      "hours_std": 6.0
+    },
+    {
+      "id": "lists_and_dictionaries",
+      "title": "القوائم والقواميس",
+      "weight": 0.2,
+      "depends_on": [
+        "variables_and_types"
+      ],
+      "hours_std": 6.0
+    },
+    {
+      "id": "control_flow",
+      "title": "الشروط والحلقات (if/else, loops)",
+      "weight": 0.2667,
+      "depends_on": [
+        "variables_and_types"
+      ],
+      "hours_std": 8.0
+    },
+    {
+      "id": "functions",
+      "title": "الدوال الأساسية def",
+      "weight": 0.2,
+      "depends_on": [
+        "control_flow"
+      ],
+      "hours_std": 6.0
+    }
+  ]
+}

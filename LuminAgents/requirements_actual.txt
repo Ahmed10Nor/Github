@@ -1,0 +1,8 @@
+crewai==1.14.2
+fastapi==0.136.0
+litellm==1.83.10
+pydantic==2.13.3
+python-dotenv==1.2.2
+python-telegram-bot==22.7
+streamlit==1.56.0
+tavily_python==0.7.23

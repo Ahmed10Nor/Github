@@ -1,0 +1,12 @@
+# LuminAgents — Portable Requirements
+# Pinned to versions tested and working
+
+crewai==0.193.2
+fastapi==0.136.0
+litellm==1.74.9
+pydantic==2.12.5
+python-dotenv==1.0.1
+python-telegram-bot==22.7
+streamlit==1.56.0
+tavily-python==0.7.23
+uvicorn==0.44.0
