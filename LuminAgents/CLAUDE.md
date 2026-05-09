@@ -10,7 +10,7 @@
 مسابقة **Agenticthon** - جامعة الأمير سطام بن عبدالعزيز.
 الفريق: أحمد، خيري، عبدالرحمن.
 
-مسار المشروع: `D:\Apps\LuminAgents`
+مسار المشروع: `.`
 
 التفاصيل الكاملة في `LuminAgents_Core_14.md` و `LuminAgents_Progress.md`.
 

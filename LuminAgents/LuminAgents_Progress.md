@@ -2,24 +2,24 @@
 
 > **آخر تحديث:** 2026-05-09 (v7.5 — Adaptive Challenge + Learning Package + Session Guards ✅)
 > **الحالة:** Bot شغّال ✅ — Dashboard 5 Tabs ✅ — test_scenarios.py **18/18** ✅ — Syntax Clean ✅
-> **المسار:** `D:\Apps\LuminAgents`
+> **المسار:** `.`
 
 ---
 
 ## 📍 بيئة التطوير
 
 ```
-المسار:   D:\Apps\LuminAgents\
+المسار:   .\
 Python:   3.11.9
-venv:     D:\Apps\LuminAgents\venv\Scripts\activate
-DB:       D:\Apps\LuminAgents\db\luminagents.db
+venv:     .\venv\Scripts\activate
+DB:       .\db\luminagents.db
 Bot:      @LuminAgents2_bot
 ```
 
 **تشغيل المشروع:**
 ```bash
 # terminal 1 — API
-cd D:\Apps\LuminAgents
+cd .
 venv\Scripts\activate
 uvicorn api.main:app --reload
 

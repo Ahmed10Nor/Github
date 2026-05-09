@@ -3,7 +3,7 @@ fix_orchestrator_duplicates.py
 One-shot repair: removes duplicate/orphaned methods from orchestrator.py
 that were introduced during emergency restoration session.
 
-Run from D:\Apps\LuminAgents:
+Run from .:
     venv\Scripts\python.exe fix_orchestrator_duplicates.py
 """
 import re

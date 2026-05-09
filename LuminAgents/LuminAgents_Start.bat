@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-cd /d "D:\Apps\LuminAgents"
+cd /d "%~dp0"
 
 echo Starting LuminAgents...
 
@@ -33,10 +33,10 @@ if not exist "venv\Scripts\activate.bat" (
 
 python fix_db.py >nul 2>&1
 
-start "API" cmd /k "cd /d D:\Apps\LuminAgents && call venv\Scripts\activate.bat && uvicorn api.main:app --reload"
+start "API" cmd /k "cd /d "%~dp0" && call venv\Scripts\activate.bat && uvicorn api.main:app --reload"
 timeout /t 3 /nobreak >nul
-start "Bot" cmd /k "cd /d D:\Apps\LuminAgents && call venv\Scripts\activate.bat && python -B telegram_bot.py"
-start "Dashboard" cmd /k "cd /d D:\Apps\LuminAgents && call venv\Scripts\activate.bat && streamlit run dashboard\streamlit_app.py"
+start "Bot" cmd /k "cd /d "%~dp0" && call venv\Scripts\activate.bat && python -B telegram_bot.py"
+start "Dashboard" cmd /k "cd /d "%~dp0" && call venv\Scripts\activate.bat && streamlit run dashboard\streamlit_app.py"
 
 echo Done. Check the opened windows.
 timeout /t 4 /nobreak >nul
